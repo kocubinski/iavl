@@ -2,17 +2,79 @@
 package iavl
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	mrand "math/rand"
+	"os"
 	"sort"
 	"testing"
 
 	db "github.com/cosmos/cosmos-db"
 	iavlrand "github.com/cosmos/iavl/internal/rand"
+	"github.com/emicklei/dot"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func graphvizRenderNode(node *Node) string {
+	if node.isLeaf() {
+		return fmt.Sprintf("%v:%v\nv%v", node.key, node.value, node.version)
+	} else {
+		return fmt.Sprintf("%v:%v\nv%v", node.subtreeHeight, node.key, node.version)
+	}
+}
+
+type dotState struct {
+	g     *dot.Graph
+	count int
+}
+
+func iterateGraphvizTree(state *dotState, node *Node, parent *dot.Node) {
+	state.count++
+	label := graphvizRenderNode(node)
+	n := state.g.Node(label)
+	if parent != nil {
+		parent.Edge(n)
+	}
+	if node.leftNode != nil {
+		iterateGraphvizTree(state, node.leftNode, &n)
+	}
+	if node.rightNode != nil {
+		iterateGraphvizTree(state, node.rightNode, &n)
+	}
+}
+
+func GraphVizTree(root *Node, filename string) {
+	f, _ := os.Create("/tmp/tree_" + filename + ".dot")
+	defer f.Close()
+
+	state := &dotState{
+		g: dot.NewGraph(dot.Directed),
+	}
+	iterateGraphvizTree(state, root, nil)
+
+	fmt.Printf("%v nodes\n", state.count)
+	w := bufio.NewWriter(f)
+	fmt.Fprintln(w, state.g.String())
+	w.Flush()
+}
+
+func TestMtkoan(t *testing.T) {
+	tree, _ := getTestTree(0)
+	for i := 0; i < 20; i++ {
+		tree.Set([]byte{byte(i)}, []byte{byte(i)})
+	}
+	GraphVizTree(tree.root, "one")
+
+	tree.SaveVersion()
+	tree.Set([]byte{10}, []byte{10, 1})
+	GraphVizTree(tree.root, "two")
+
+	tree.SaveVersion()
+	GraphVizTree(tree.ImmutableTree.root, "three")
+}
 
 func TestBasic(t *testing.T) {
 	tree, err := getTestTree(0)
@@ -36,6 +98,11 @@ func TestBasic(t *testing.T) {
 	require.NoError(t, err)
 	if up {
 		t.Error("Did not expect an update (should have been create)")
+	}
+
+	ss, err := tree.RenderShape(" ", nil)
+	for _, s := range ss {
+		fmt.Println(s)
 	}
 
 	// Test 0x00
