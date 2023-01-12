@@ -27,53 +27,79 @@ func graphvizRenderNode(node *Node) string {
 }
 
 type dotState struct {
-	g     *dot.Graph
+	gviz  *dot.Graph
+	itree *ImmutableTree
 	count int
 }
 
 func iterateGraphvizTree(state *dotState, node *Node, parent *dot.Node) {
 	state.count++
 	label := graphvizRenderNode(node)
-	n := state.g.Node(label)
+
+	n := state.gviz.Node(label)
 	if parent != nil {
 		parent.Edge(n)
 	}
+
+	var leftNode, rightNode *Node
+
 	if node.leftNode != nil {
-		iterateGraphvizTree(state, node.leftNode, &n)
+		leftNode = node.leftNode
+	} else if node.leftHash != nil {
+		in, err := node.getLeftNode(state.itree)
+		if err == nil {
+			leftNode = in
+		}
 	}
+
 	if node.rightNode != nil {
-		iterateGraphvizTree(state, node.rightNode, &n)
+		rightNode = node.rightNode
+	} else if node.rightHash != nil {
+		in, err := node.getRightNode(state.itree)
+		if err == nil {
+			rightNode = in
+		}
+	}
+
+	if leftNode != nil {
+		iterateGraphvizTree(state, leftNode, &n)
+	}
+	if rightNode != nil {
+		iterateGraphvizTree(state, rightNode, &n)
 	}
 }
 
-func GraphVizTree(root *Node, filename string) {
+func GraphVizTree(tree *MutableTree, filename string) {
 	f, _ := os.Create("/tmp/tree_" + filename + ".dot")
 	defer f.Close()
 
 	state := &dotState{
-		g: dot.NewGraph(dot.Directed),
+		gviz:  dot.NewGraph(dot.Directed),
+		itree: tree.ImmutableTree,
 	}
-	iterateGraphvizTree(state, root, nil)
+	iterateGraphvizTree(state, tree.root, nil)
 
 	fmt.Printf("%v nodes\n", state.count)
 	w := bufio.NewWriter(f)
-	fmt.Fprintln(w, state.g.String())
+	fmt.Fprintln(w, state.gviz.String())
 	w.Flush()
 }
 
-func TestMtkoan(t *testing.T) {
+func TestVisualize(t *testing.T) {
 	tree, _ := getTestTree(0)
 	for i := 0; i < 20; i++ {
 		tree.Set([]byte{byte(i)}, []byte{byte(i)})
 	}
-	GraphVizTree(tree.root, "one")
+	GraphVizTree(tree, "one")
 
 	tree.SaveVersion()
 	tree.Set([]byte{10}, []byte{10, 1})
-	GraphVizTree(tree.root, "two")
-
+	GraphVizTree(tree, "two")
 	tree.SaveVersion()
-	GraphVizTree(tree.ImmutableTree.root, "three")
+
+	tree.Set([]byte{8}, []byte{10, 1})
+	tree.Set([]byte{2, 1}, []byte{2})
+	GraphVizTree(tree, "three")
 }
 
 func TestBasic(t *testing.T) {
