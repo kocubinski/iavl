@@ -535,12 +535,15 @@ func (ndb *nodeDB) DeleteVersionsRange(fromVersion, toVersion int64) error {
 	// If the predecessor is earlier than the beginning of the lifetime, we can delete the orphan.
 	// Otherwise, we shorten its lifetime, by moving its endpoint to the predecessor version.
 	for version := fromVersion; version < toVersion; version++ {
+		// iterate all nodes which expire at `version`
 		err := ndb.traverseOrphansVersion(version, func(key, hash []byte) error {
 			var from, to int64
 			orphanKeyFormat.Scan(key, &to, &from)
+			// delete each orphan which expires at `version`
 			if err := ndb.batch.Delete(key); err != nil {
 				return err
 			}
+			// if
 			if from > predecessor {
 				if err := ndb.batch.Delete(ndb.nodeKey(hash)); err != nil {
 					return err
@@ -621,7 +624,7 @@ func (ndb *nodeDB) deleteNodesFrom(version int64, hash []byte) error {
 	return nil
 }
 
-// Saves orphaned nodes to disk under a special prefix.
+// SaveOrphans saves orphaned nodes to disk under a special prefix.
 // version: the new version being saved.
 // orphans: the orphan nodes created since version-1
 func (ndb *nodeDB) SaveOrphans(version int64, orphans map[string]int64) error {

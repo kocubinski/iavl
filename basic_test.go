@@ -99,7 +99,12 @@ func TestVisualize(t *testing.T) {
 
 	tree.Set([]byte{8}, []byte{10, 1})
 	tree.Set([]byte{2, 1}, []byte{2})
+	tree.SaveVersion()
 	GraphVizTree(tree, "three")
+
+	tree.Remove([]byte{16})
+	tree.SaveVersion()
+	GraphVizTree(tree, "four")
 }
 
 func TestBasic(t *testing.T) {
