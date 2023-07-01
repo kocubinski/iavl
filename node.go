@@ -12,6 +12,7 @@ import (
 
 	"github.com/cosmos/iavl/cache"
 	"github.com/pkg/errors"
+	dbm "github.com/tendermint/tm-db"
 
 	"github.com/cosmos/iavl/internal/encoding"
 )
@@ -546,6 +547,106 @@ func (node *Node) traverseInRange(tree *ImmutableTree, start, end []byte, ascend
 		}
 	}
 	return stop
+}
+
+// GetVersion returns the version of the node
+func (node *Node) GetVersion() int64 {
+	return node.version
+}
+
+func (node *Node) GetValue() []byte {
+	return node.value
+}
+
+func (node *Node) GetLogicalKey() []byte {
+	return node.key
+}
+
+func (node *Node) IsLeaf() bool {
+	return node.isLeaf()
+}
+
+func (node *Node) Has(db dbm.DB, key []byte) (bool, error) {
+	if bytes.Equal(node.key, key) {
+		return true, nil
+	}
+	if node.isLeaf() {
+		return false, nil
+	}
+
+	if bytes.Compare(key, node.key) < 0 {
+		var leftNode *Node
+		if node.leftNode != nil {
+			leftNode = node.leftNode
+		} else {
+			buf, err := db.Get(nodeKeyFormat.Key(node.leftHash))
+			if err != nil {
+				return false, err
+			}
+			leftNode, err = MakeNode(buf)
+			if err != nil {
+				return false, err
+			}
+		}
+		return leftNode.Has(db, key)
+	}
+
+	var rightNode *Node
+	if node.leftNode != nil {
+		rightNode = node.leftNode
+	} else {
+		buf, err := db.Get(nodeKeyFormat.Key(node.rightHash))
+		if err != nil {
+			return false, err
+		}
+		rightNode, err = MakeNode(buf)
+		if err != nil {
+			return false, err
+		}
+	}
+	return rightNode.Has(db, key)
+}
+
+func LeafNodeHash(key, value []byte, version int64) ([]byte, error) {
+	h := sha256.New()
+	var buf bytes.Buffer
+	// height
+	err := encoding.EncodeVarint(&buf, 0)
+	if err != nil {
+		return nil, err
+	}
+	// size
+	err = encoding.EncodeVarint(&buf, 1)
+	if err != nil {
+		return nil, err
+	}
+	// version
+	err = encoding.EncodeVarint(&buf, version)
+	if err != nil {
+		return nil, err
+	}
+
+	//key
+	err = encoding.EncodeBytes(&buf, key)
+	if err != nil {
+		return nil, err
+	}
+
+	// value
+	valueHash := sha256.Sum256(value)
+	err = encoding.EncodeBytes(&buf, valueHash[:])
+	if err != nil {
+		return nil, err
+	}
+	_, err = h.Write(buf.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
+}
+
+func (node *Node) ComputeHash() ([]byte, error) {
+	return node._hash()
 }
 
 var (

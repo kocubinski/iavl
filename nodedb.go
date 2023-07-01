@@ -120,13 +120,13 @@ func (ndb *nodeDB) unsafeGetNode(hash []byte) (*Node, error) {
 		return nil, ErrNodeMissingHash
 	}
 
-	// Check the cache.
-	if cachedNode := ndb.nodeCache.Get(hash); cachedNode != nil {
-		ndb.opts.Stat.IncCacheHitCnt()
-		return cachedNode.(*Node), nil
-	}
+	//Check the cache.
+	//if cachedNode := ndb.nodeCache.Get(hash); cachedNode != nil {
+	//	ndb.opts.Stat.IncCacheHitCnt()
+	//	return cachedNode.(*Node), nil
+	//}
 
-	ndb.opts.Stat.IncCacheMissCnt()
+	//ndb.opts.Stat.IncCacheMissCnt()
 
 	// Doesn't exist, load.
 	buf, err := ndb.db.Get(ndb.nodeKey(hash))
@@ -144,7 +144,7 @@ func (ndb *nodeDB) unsafeGetNode(hash []byte) (*Node, error) {
 
 	node.hash = hash
 	node.persisted = true
-	ndb.nodeCache.Add(node)
+	//ndb.nodeCache.Add(node)
 
 	return node, nil
 }
@@ -1147,6 +1147,10 @@ func (ndb *nodeDB) String() (string, error) {
 	}
 
 	return "-" + "\n" + buf.String() + "-", nil
+}
+
+func (ndb *nodeDB) GetRoot(version int64) ([]byte, error) {
+	return ndb.getRoot(version)
 }
 
 var (
