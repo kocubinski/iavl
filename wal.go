@@ -299,8 +299,9 @@ func (r *Wal) Checkpoint(index uint64, version int64, cache NodeCache) error {
 	//r.cacheLock.Unlock()
 	// TODO: delete from async commit
 	r.hotCache = &walCache{
-		puts:    make(map[nodeCacheKey]*deferredNode),
-		deletes: []*deferredNode{},
+		puts:         make(map[nodeCacheKey]*deferredNode),
+		deletes:      []*deferredNode{},
+		sinceVersion: version + 1,
 	}
 
 	//if r.MetricWalSize != nil {
