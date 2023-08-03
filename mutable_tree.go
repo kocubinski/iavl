@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	log "cosmossdk.io/log"
 	dbm "github.com/cosmos/cosmos-db"
@@ -46,6 +47,8 @@ type MutableTree struct {
 	MetricTreeHeight GaugeMetric
 	MetricTreeSize   GaugeMetric
 
+	CheckpointSignal chan struct{}
+
 	// TODO, dev only.. remove.
 	nopMode bool
 	//
@@ -62,7 +65,8 @@ func NewMutableTreeWithOpts(db dbm.DB, cacheSize int, opts *Options, skipFastSto
 	head := &ImmutableTree{
 		ndb:                    ndb,
 		skipFastStorageUpgrade: skipFastStorageUpgrade,
-		lruSize:                1_000_000,
+		lru:                    &treeLru{capacity: cacheSize},
+		ghostLru:               &treeLru{capacity: -1},
 	}
 	var nopMode bool
 	if opts != nil {
@@ -285,6 +289,9 @@ func (tree *MutableTree) recursiveSet(node *Node, key []byte, value []byte) (
 ) {
 	version := tree.version + 1
 
+	if node == nil {
+		panic("nil node, this should not happen")
+	}
 	if node.isLeaf() {
 		if !tree.skipFastStorageUpgrade {
 			tree.addUnsavedAddition(key, fastnode.NewNode(key, value, version))
@@ -300,12 +307,8 @@ func (tree *MutableTree) recursiveSet(node *Node, key []byte, value []byte) (
 				rightNode:     node,
 				ghost:         true,
 			}
-			n.leftNode.onEvict = func() {
-				n.leftNode = nil
-			}
-			n.rightNode.onEvict = func() {
-				n.rightNode = nil
-			}
+			n.SetEvictLeft()
+			n.SetEvictRight()
 			tree.PushFront(n)
 			return n, false, nil
 		case 1: // setKey > leafKey
@@ -318,12 +321,8 @@ func (tree *MutableTree) recursiveSet(node *Node, key []byte, value []byte) (
 				rightNode:     tree.NewGhostNode(key, value),
 				ghost:         true,
 			}
-			n.leftNode.onEvict = func() {
-				n.leftNode = nil
-			}
-			n.rightNode.onEvict = func() {
-				n.rightNode = nil
-			}
+			n.SetEvictLeft()
+			n.SetEvictRight()
 			tree.PushFront(n)
 			return n, false, nil
 		default:
@@ -343,22 +342,14 @@ func (tree *MutableTree) recursiveSet(node *Node, key []byte, value []byte) (
 		}
 
 		if bytes.Compare(key, node.key) < 0 {
-			node.leftNode, updated, err = tree.recursiveSet(node.leftNode, key, value)
-			if node.leftNode.ghost {
-				node.leftNode.onEvict = func() {
-					node.leftNode = nil
-				}
-			}
+			node.leftNode, updated, err = tree.recursiveSet(tree.getLeftNode(node), key, value)
+			node.SetEvictLeft()
 			if err != nil {
 				return nil, updated, err
 			}
 		} else {
-			node.rightNode, updated, err = tree.recursiveSet(node.rightNode, key, value)
-			if node.rightNode.ghost {
-				node.rightNode.onEvict = func() {
-					node.rightNode = nil
-				}
-			}
+			node.rightNode, updated, err = tree.recursiveSet(tree.getRightNode(node), key, value)
+			node.SetEvictRight()
 			if err != nil {
 				return nil, updated, err
 			}
@@ -843,6 +834,22 @@ func (tree *MutableTree) SaveVersion() ([]byte, int64, error) {
 		}
 	}
 
+	if tree.CheckpointSignal != nil {
+		select {
+		case _, ok := <-tree.CheckpointSignal:
+			if ok {
+				since := time.Now()
+				fmt.Println("MergeGhosts")
+				tree.MergeGhosts()
+				fmt.Println("MergeGhosts took", time.Since(since))
+			} else {
+				fmt.Println("CheckpointSignal channel closed")
+				tree.CheckpointSignal = nil
+			}
+		default:
+		}
+	}
+
 	tree.version = version
 
 	// set new working tree
@@ -962,12 +969,8 @@ func (tree *MutableTree) rotateRight(node *Node) (*Node, error) {
 
 	node.leftNode = newNode.rightNode
 	newNode.rightNode = node
-	newNode.rightNode.onEvict = func() {
-		node.leftNode = nil
-	}
-	node.onEvict = func() {
-		newNode.rightNode = nil
-	}
+	newNode.rightNode.SetEvictLeft()
+	node.SetEvictRight()
 
 	err = node.calcHeightAndSize(tree.ImmutableTree)
 	if err != nil {
@@ -1002,12 +1005,8 @@ func (tree *MutableTree) rotateLeft(node *Node) (*Node, error) {
 	newNode := node.rightNode
 	node.rightNode = newNode.leftNode
 	newNode.leftNode = node
-	newNode.leftNode.onEvict = func() {
-		node.rightNode = nil
-	}
-	node.onEvict = func() {
-		newNode.leftNode = nil
-	}
+	newNode.leftNode.SetEvictRight()
+	node.SetEvictLeft()
 
 	err = node.calcHeightAndSize(tree.ImmutableTree)
 	if err != nil {
@@ -1154,6 +1153,56 @@ func (tree *MutableTree) saveNewNodes(version int64) error {
 	}
 
 	return nil
+}
+
+func (tree *MutableTree) getLeftNode(node *Node) *Node {
+	if node.leftNode != nil {
+		tree.MoveToFront(node.leftNode)
+		return node.leftNode
+	}
+
+	var leftNode *Node
+	var err error
+	start := time.Now()
+	if tree.nodeBackened != nil {
+		leftNode, err = tree.nodeBackened.GetNode(node.leftNodeKey)
+	} else {
+		leftNode, err = tree.ndb.GetNode(node.leftNodeKey)
+	}
+	getNodeTime += time.Since(start).Nanoseconds()
+	if err != nil {
+		panic(err)
+	}
+
+	node.SetEvictLeft()
+	tree.PushFront(leftNode)
+	node.leftNode = leftNode
+	return leftNode
+}
+
+func (tree *MutableTree) getRightNode(node *Node) *Node {
+	if node.rightNode != nil {
+		tree.MoveToFront(node.rightNode)
+		return node.rightNode
+	}
+
+	var rightNode *Node
+	var err error
+	start := time.Now()
+	if tree.nodeBackened != nil {
+		rightNode, err = tree.nodeBackened.GetNode(node.rightNodeKey)
+	} else {
+		rightNode, err = tree.ndb.GetNode(node.rightNodeKey)
+	}
+	getNodeTime += time.Since(start).Nanoseconds()
+	if err != nil {
+		panic(err)
+	}
+
+	node.SetEvictRight()
+	tree.PushFront(rightNode)
+	node.rightNode = rightNode
+	return rightNode
 }
 
 func (tree *MutableTree) addOrphan(orphan *Node) error {

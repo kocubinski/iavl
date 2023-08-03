@@ -70,96 +70,88 @@ func (c *NodeMapCache) Size() int {
 	return len(c.cache)
 }
 
-func (t *ImmutableTree) PushFront(node *Node) {
-	//if node.onEvict == nil {
-	//	panic("node.onEvict is nil")
-	//}
+type treeLru struct {
+	head     *Node
+	tail     *Node
+	length   int
+	capacity int
+}
 
-	if t.lruHead == nil {
-		t.lruHead = node
-		t.lruTail = node
-		t.lruLength = 1
+func (lru *treeLru) PushFront(node *Node) {
+	if node.nodeKey != nil && node.nodeKey.String() == "(164528, 98)" {
+		fmt.Printf("lru: seen! PushFront: %s ghost=%t\n", node.nodeKey, node.ghost)
+	}
+
+	if lru.head == nil {
+		fmt.Printf("lru: PushFront: new head is %s ghost=%t\n", node.nodeKey, node.ghost)
+		lru.head = node
+		lru.tail = node
+		// ensure prev is nil
+		lru.tail.prev = nil
+		lru.length = 1
 		return
 	}
 
-	if t.lruHead == node {
+	if lru.head == node {
 		return
 	}
 
-	node.prev = t.lruHead
-	t.lruHead.next = node
-	t.lruHead = node
-	t.lruLength++
+	node.prev = lru.head
+	lru.head.next = node
+	lru.head = node
+	// ensure next is nil at head
+	lru.head.next = nil
+	lru.length++
 
-	// prune
-	if t.lruLength > t.lruSize {
-		n := t.lruTail
-		i := 0
-		for ; n != nil && i <= 1_000; n = n.next {
-			// never evict ghost nodes
-			if !n.ghost {
-				break
-			}
-			i++
-			if i == 1_000 {
-				fmt.Printf("prune loop exceeded 1_000 iterations, this should never happen\n")
-			}
+	// prune. capacity -1 means unbounded
+	if lru.capacity > -1 && lru.length > lru.capacity {
+		if lru.tail.onEvict == nil {
+			panic("lru.tail.onEvict is nil")
 		}
-		if n.prev != nil {
-			n.prev.next = n.next
-		}
-		if n.next != nil {
-			n.next.prev = n.prev
-		}
-		if n.onEvict == nil {
-			panic("node.onEvict is nil in PushFront")
-		}
-		n.onEvict()
-		if t.lruTail == n {
-			t.lruTail = n.next
-		}
-		t.lruLength--
+		lru.tail.onEvict(lru.tail)
+		lru.tail = lru.tail.next
+		lru.tail.prev = nil
+		lru.length--
 	}
 }
 
-func (t *ImmutableTree) MoveToFront(node *Node) {
-	if node.onEvict == nil {
-		panic("node.onEvict is nil")
+func (lru *treeLru) MoveToFront(node *Node) {
+	if node.nodeKey != nil && node.nodeKey.String() == "(164528, 98)" {
+		fmt.Printf("lru: seen! PushFront: %s ghost=%t\n", node.nodeKey, node.ghost)
 	}
 	if node.prev == nil && node.next == nil {
 		panic("node.prev and node.next are nil")
 	}
 
-	if t.lruHead == node {
+	if lru.head == node {
 		return
 	}
 
 	// not tail
-	if node != t.lruTail {
+	if node != lru.tail {
+		if node.prev == nil {
+			panic(fmt.Sprintf("node.prev is nil for %s", node.nodeKey))
+		}
 		node.prev.next = node.next
 	} else {
-		t.lruTail = node.next
-		t.lruTail.prev = nil
+		lru.tail = node.next
+		lru.tail.prev = nil
 	}
 
 	node.next.prev = node.prev
-	t.lruHead.next = node
-	node.prev = t.lruHead
+	lru.head.next = node
+	node.prev = lru.head
 	node.next = nil
-	t.lruHead = node
+	lru.head = node
 }
 
-func (t *ImmutableTree) Unlink(node *Node) {
-	if node.onEvict == nil {
-		panic("node.onEvict is nil")
+func (lru *treeLru) Unlink(node *Node) {
+	if lru.head == node {
+		lru.head = node.prev
 	}
 
-	if t.lruHead == node {
-		t.lruHead = node.prev
-	}
-
-	if t.lruTail == node {
-		t.lruTail = node.next
+	if lru.tail == node {
+		lru.tail = node.next
 	}
 
 	if node.prev != nil {
@@ -173,8 +165,100 @@ func (t *ImmutableTree) Unlink(node *Node) {
 	node.prev = nil
 	node.next = nil
 	// unsure if this callback is needed on remove
-	node.onEvict()
-	t.lruLength--
+	node.onEvict(node)
+	lru.length--
+}
+
+// PushFront encapsulates access to the LRU cache, both the main and ghost caches.
+func (t *ImmutableTree) PushFront(node *Node) {
+	if node.ghost {
+		t.ghostLru.PushFront(node)
+	} else {
+		t.lru.PushFront(node)
+	}
+}
+
+func (t *ImmutableTree) MoveToFront(node *Node) {
+	if node.ghost {
+		t.ghostLru.MoveToFront(node)
+	} else {
+		t.lru.MoveToFront(node)
+	}
+}
+
+func (t *ImmutableTree) Unlink(node *Node) {
+	if node.ghost {
+		t.ghostLru.Unlink(node)
+	} else {
+		t.lru.Unlink(node)
+	}
+}
+
+func (t *ImmutableTree) MergeGhosts() {
+	maxGhosts := t.lru.capacity / 3
+	if t.ghostLru.length == 0 {
+		return
+	}
+	newLru := &treeLru{capacity: t.lru.capacity}
+
+	// merging iterator
+	lastPick := 0
+	g := t.ghostLru.head
+	m := t.lru.head
+	var n *Node
+	next := func() {
+		if g == nil && m == nil {
+			n = nil
+			return
+		}
+		// look ahead
+		if g == nil {
+			n = m
+			m = m.prev
+			return
+		}
+		if m == nil {
+			n = g
+			n.ghost = true
+			g = g.prev
+			return
+		}
+		if lastPick == 0 {
+			n = g
+			n.ghost = true
+			g = g.prev
+			lastPick = 1
+		} else {
+			n = m
+			m = m.prev
+			lastPick = 0
+		}
+	}
+
+	i := 0
+	var ghostCount int
+	for next(); n != nil; next() {
+		if n.ghost {
+			if ghostCount > maxGhosts {
+				n.onEvict(n)
+			} else {
+				newLru.PushFront(n)
+				n.next = nil
+			}
+			n.ghost = false
+			ghostCount++
+		} else {
+			newLru.PushFront(n)
+			n.next = nil
+		}
+		i++
+		if i%100_000_000 == 0 {
+			fmt.Printf("i: %d\n", i)
+		}
+	}
+
+	t.lru = newLru
+	t.ghostLru = &treeLru{capacity: t.ghostLru.capacity}
 }
 
 // TODO: this func may need parent and isLeftNode args to construct onEvict callback
@@ -189,4 +273,23 @@ func (t *ImmutableTree) NewGhostNode(key []byte, value []byte) *Node {
 
 	t.PushFront(node)
 	return node
+}
+
+func (node *Node) SetEvictLeft() {
+	// node is the parent
+	node.leftNode.onEvict = func(e *Node) {
+		// if the child is still the same, remove the ref
+		if e == nil && e == node.leftNode {
+			node.leftNode = nil
+		}
+	}
+}
+
+func (node *Node) SetEvictRight() {
+	// node is the parent
+	node.rightNode.onEvict = func(e *Node) {
+		if e == nil && e == node.rightNode {
+			node.rightNode = nil
+		}
+	}
 }

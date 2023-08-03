@@ -85,7 +85,7 @@ type Node struct {
 	prev    *Node
 	next    *Node
 	ghost   bool
-	onEvict func()
+	onEvict func(*Node)
 }
 
 var _ cache.Node = (*Node)(nil)
@@ -303,6 +303,7 @@ func (node *Node) String() string {
 }
 
 func (node *Node) fade() error {
+	// is this right though?
 	if node.IsLeaf() {
 		return fmt.Errorf("won't fade a leaf node")
 	}
@@ -706,9 +707,7 @@ func (node *Node) getLeftNode(t *ImmutableTree) (*Node, error) {
 		return nil, err
 	}
 
-	leftNode.onEvict = func() {
-		node.leftNode = nil
-	}
+	node.SetEvictLeft()
 	t.PushFront(leftNode)
 
 	return leftNode, nil
@@ -730,9 +729,7 @@ func (node *Node) getRightNode(t *ImmutableTree) (*Node, error) {
 		return nil, err
 	}
 
-	rightNode.onEvict = func() {
-		node.rightNode = nil
-	}
+	node.SetEvictRight()
 	t.PushFront(rightNode)
 
 	return rightNode, nil

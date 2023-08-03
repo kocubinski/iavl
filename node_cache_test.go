@@ -8,11 +8,12 @@ import (
 )
 
 func TestNodeCache(t *testing.T) {
-	tree := &ImmutableTree{lruSize: 10}
+	lru := &treeLru{capacity: 10}
+	tree := &ImmutableTree{lru: lru}
 
 	assertPointers := func(expectedCount int) {
 		count := 0
-		for n := tree.lruTail; n != nil; n = n.next {
+		for n := lru.tail; n != nil; n = n.next {
 			count++
 			if count > expectedCount {
 				t.Fatal("expectedCount exceeded")
@@ -21,15 +22,15 @@ func TestNodeCache(t *testing.T) {
 		require.Equal(t, expectedCount, count)
 	}
 	purge := func() {
-		for n := tree.lruTail; n != nil; {
+		for n := lru.tail; n != nil; {
 			next := n.next
 			n.prev = nil
 			n.next = nil
 			n = next
 		}
-		tree.lruHead = nil
-		tree.lruTail = nil
-		tree.lruLength = 0
+		lru.head = nil
+		lru.tail = nil
+		lru.length = 0
 	}
 
 	n1 := &Node{key: []byte("1"), onEvict: func() {
@@ -53,28 +54,28 @@ func TestNodeCache(t *testing.T) {
 	tree.PushFront(n4)
 	tree.PushFront(n5)
 	assertPointers(5)
-	require.Equal(t, 5, tree.lruLength)
-	require.Equal(t, n5, tree.lruHead)
-	require.Equal(t, n1, tree.lruTail)
+	require.Equal(t, 5, lru.length)
+	require.Equal(t, n5, lru.head)
+	require.Equal(t, n1, lru.tail)
 
 	tree.Unlink(n3)
-	require.Equal(t, 4, tree.lruLength)
+	require.Equal(t, 4, lru.length)
 	assertPointers(4)
 
 	tree.PushFront(n3)
 	assertPointers(5)
-	require.Equal(t, 5, tree.lruLength)
-	require.Equal(t, n3, tree.lruHead)
+	require.Equal(t, 5, lru.length)
+	require.Equal(t, n3, lru.head)
 
 	tree.MoveToFront(n2)
-	require.Equal(t, 5, tree.lruLength)
-	require.Equal(t, n2, tree.lruHead)
+	require.Equal(t, 5, lru.length)
+	require.Equal(t, n2, lru.head)
 	assertPointers(5)
 
-	tree.MoveToFront(tree.lruTail)
+	tree.MoveToFront(lru.tail)
 	assertPointers(5)
 
-	tree.MoveToFront(tree.lruHead)
+	tree.MoveToFront(lru.head)
 	assertPointers(5)
 
 	// round 2

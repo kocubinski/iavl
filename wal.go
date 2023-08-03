@@ -131,6 +131,7 @@ type Wal struct {
 	checkpointInterval int
 	checkpointHead     uint64
 	checkpointCh       chan *checkpointArgs
+	CheckpointSignal   chan struct{}
 
 	cacheLock sync.RWMutex
 	hotCache  *walCache
@@ -158,8 +159,9 @@ func NewWal(wal *wal.Log, commitment dbm.DB, storage *SqliteDb) *Wal {
 		storage:            storage,
 		hotCache:           hot,
 		coldCache:          cold,
-		checkpointCh:       make(chan *checkpointArgs, 100),
-		checkpointInterval: 100,
+		checkpointCh:       make(chan *checkpointArgs, 10),
+		checkpointInterval: 10,
+		CheckpointSignal:   make(chan struct{}, 2),
 	}
 }
 
@@ -256,13 +258,16 @@ func (r *Wal) CheckpointRunner(ctx context.Context) error {
 }
 
 func (r *Wal) Checkpoint(index uint64, version int64, cache NodeCache) error {
+	// TODO: IMPORTANT: change this coldCatch for async checkpointing
+	// ideally this is managed by configuration
+	wcache := r.hotCache
 	start := time.Now()
 	setCount := 0
 	deleteCount := 0
 	fmt.Printf("wal: checkpointing now. [%d - %d) will be flushed to state commitment\n",
 		r.checkpointHead, index)
 	buf := new(bytes.Buffer)
-	for k, dn := range r.coldCache.puts {
+	for k, dn := range wcache.puts {
 		err := dn.node.writeBytes(buf)
 		if err != nil {
 			return err
@@ -271,13 +276,10 @@ func (r *Wal) Checkpoint(index uint64, version int64, cache NodeCache) error {
 		if err != nil {
 			return err
 		}
-		//cache.Add(k, dn.node)
-		// danger?
-		dn.node.ghost = false
 		buf.Reset()
 		setCount++
 	}
-	for _, dn := range r.coldCache.deletes {
+	for _, dn := range wcache.deletes {
 		err := r.commitment.Delete(dn.nodeKey[:])
 		if err != nil {
 			return err
@@ -288,13 +290,18 @@ func (r *Wal) Checkpoint(index uint64, version int64, cache NodeCache) error {
 		return err
 	}
 
-	r.cacheLock.Lock()
-	//r.cache = make(map[nodeCacheKey]*deferredNode)
-	r.coldCache = &walCache{
+	// TODO: for async commit
+	//r.cacheLock.Lock()
+	//r.coldCache = &walCache{
+	//	puts:    make(map[nodeCacheKey]*deferredNode),
+	//	deletes: []*deferredNode{},
+	//}
+	//r.cacheLock.Unlock()
+	// TODO: delete from async commit
+	r.hotCache = &walCache{
 		puts:    make(map[nodeCacheKey]*deferredNode),
 		deletes: []*deferredNode{},
 	}
-	r.cacheLock.Unlock()
 
 	//if r.MetricWalSize != nil {
 	//	r.MetricWalSize.Sub(checkpointBz)
@@ -304,6 +311,10 @@ func (r *Wal) Checkpoint(index uint64, version int64, cache NodeCache) error {
 	}
 	r.checkpointHead = index
 	//checkpointBz = 0
+
+	if r.CheckpointSignal != nil {
+		r.CheckpointSignal <- struct{}{}
+	}
 
 	fmt.Printf("wal: checkpoint completed in %.3fs; %d sets, %d deletes\n",
 		time.Since(start).Seconds(), setCount, deleteCount)

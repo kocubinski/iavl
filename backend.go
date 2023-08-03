@@ -123,11 +123,12 @@ func (kv *KeyValueBackend) Commit(version int64) error {
 			return err
 		}
 		// TODO: support single threaded checkpoint by configuration
-		//err = kv.wal.MaybeCheckpoint(kv.walIdx, version, kv.nodeCache)
-		//if err != nil {
-		//	return err
-		//}
-		kv.wal.checkpointCh <- &checkpointArgs{kv.walIdx, version, kv.nodeCache}
+		err = kv.wal.MaybeCheckpoint(kv.walIdx, version, kv.nodeCache)
+		if err != nil {
+			return err
+		}
+		// ASYNC checkpoint
+		//kv.wal.checkpointCh <- &checkpointArgs{kv.walIdx, version, kv.nodeCache}
 		kv.walBuf.Reset()
 		kv.walIdx++
 	}
@@ -143,30 +144,29 @@ func (kv *KeyValueBackend) Commit(version int64) error {
 }
 
 func (kv *KeyValueBackend) GetNode(nodeKey []byte) (*Node, error) {
-	if kv.nodeCache == nil {
-		panic("GetNode should be be called in this configuration")
-	}
 	var nk nodeCacheKey
 	copy(nk[:], nodeKey)
 
-	// fetch from wal cache
-	node, err := kv.wal.CacheGet(nk)
-	if err != nil {
-		return nil, err
-	}
-	if node != nil {
-		return node, nil
-	}
-
-	// fetch lru cache
-	if n, ok := kv.nodeCache.Get(nk); ok {
-		if kv.MetricCacheHit != nil {
-			kv.MetricCacheHit.Inc()
+	if kv.nodeCache != nil {
+		// fetch from wal cache
+		node, err := kv.wal.CacheGet(nk)
+		if err != nil {
+			return nil, err
 		}
-		return n, nil
-	}
-	if kv.MetricCacheMiss != nil {
-		kv.MetricCacheMiss.Inc()
+		if node != nil {
+			return node, nil
+		}
+
+		// fetch lru cache
+		if n, ok := kv.nodeCache.Get(nk); ok {
+			if kv.MetricCacheHit != nil {
+				kv.MetricCacheHit.Inc()
+			}
+			return n, nil
+		}
+		if kv.MetricCacheMiss != nil {
+			kv.MetricCacheMiss.Inc()
+		}
 	}
 
 	// fetch from commitment store
@@ -184,7 +184,7 @@ func (kv *KeyValueBackend) GetNode(nodeKey []byte) (*Node, error) {
 	if value == nil {
 		return nil, fmt.Errorf("kv/GetNode; node not found; nodeKey: %s [%X]", GetNodeKey(nodeKey), nodeKey)
 	}
-	node, err = MakeNode(nodeKey, value)
+	node, err := MakeNode(nodeKey, value)
 	if err != nil {
 		return nil, fmt.Errorf("kv/GetNode/MakeNode; nodeKey: %s [%X]; bytes: %X; %w",
 			GetNodeKey(nodeKey), nodeKey, value, err)
