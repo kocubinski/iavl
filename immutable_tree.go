@@ -25,6 +25,9 @@ type ImmutableTree struct {
 
 	lru      *treeLru
 	ghostLru *treeLru
+
+	stdLru      *stdLru
+	stdGhostLru *stdLru
 }
 
 // NewImmutableTree creates both in-memory and persistent instances
@@ -324,6 +327,8 @@ func (t *ImmutableTree) clone() *ImmutableTree {
 		skipFastStorageUpgrade: t.skipFastStorageUpgrade,
 		lru:                    t.lru,
 		ghostLru:               t.ghostLru,
+		stdLru:                 t.stdLru,
+		stdGhostLru:            t.stdGhostLru,
 	}
 }
 

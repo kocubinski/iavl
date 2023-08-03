@@ -5,6 +5,7 @@ package iavl
 
 import (
 	"bytes"
+	"container/list"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -86,6 +87,8 @@ type Node struct {
 	next    *Node
 	ghost   bool
 	onEvict func(*Node)
+
+	lruElement *list.Element
 }
 
 var _ cache.Node = (*Node)(nil)

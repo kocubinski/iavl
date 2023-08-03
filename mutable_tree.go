@@ -65,8 +65,10 @@ func NewMutableTreeWithOpts(db dbm.DB, cacheSize int, opts *Options, skipFastSto
 	head := &ImmutableTree{
 		ndb:                    ndb,
 		skipFastStorageUpgrade: skipFastStorageUpgrade,
-		lru:                    &treeLru{capacity: cacheSize},
-		ghostLru:               &treeLru{capacity: -1},
+		//lru:                    &treeLru{capacity: cacheSize},
+		//ghostLru:               &treeLru{capacity: -1},
+		stdLru:      newStdLru(cacheSize),
+		stdGhostLru: newStdLru(-1),
 	}
 	var nopMode bool
 	if opts != nil {
@@ -840,7 +842,7 @@ func (tree *MutableTree) SaveVersion() ([]byte, int64, error) {
 			if ok {
 				since := time.Now()
 				fmt.Println("MergeGhosts")
-				tree.MergeGhosts()
+				tree.StdMergeGhosts()
 				fmt.Println("MergeGhosts took", time.Since(since))
 			} else {
 				fmt.Println("CheckpointSignal channel closed")

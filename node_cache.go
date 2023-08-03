@@ -1,6 +1,7 @@
 package iavl
 
 import (
+	"container/list"
 	"fmt"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -68,6 +69,42 @@ func (c *NodeMapCache) Remove(nk nodeCacheKey) {
 
 func (c *NodeMapCache) Size() int {
 	return len(c.cache)
+}
+
+type stdLru struct {
+	l        *list.List
+	capacity int
+}
+
+func newStdLru(capacity int) *stdLru {
+	return &stdLru{
+		l:        list.New(),
+		capacity: capacity,
+	}
+}
+
+func (lru *stdLru) PushFront(node *Node) {
+	node.lruElement = lru.l.PushFront(node)
+	if lru.capacity > -1 && lru.l.Len() > lru.capacity {
+		back := lru.l.Back()
+		lru.l.Remove(back)
+		backNode := back.Value.(*Node)
+		backNode.onEvict(backNode)
+	}
+}
+
+func (lru *stdLru) MoveToFront(node *Node) {
+	if node.lruElement == nil {
+		panic("node not in lru")
+	}
+	lru.l.MoveToFront(node.lruElement)
+}
+
+func (lru *stdLru) Remove(node *Node) {
+	if node.lruElement == nil {
+		panic("node not in lru")
+	}
+	lru.l.Remove(node.lruElement)
 }
 
 type treeLru struct {
@@ -172,26 +209,85 @@ func (lru *treeLru) Unlink(node *Node) {
 // PushFront encapsulates access to the LRU cache, both the main and ghost caches.
 func (t *ImmutableTree) PushFront(node *Node) {
 	if node.ghost {
-		t.ghostLru.PushFront(node)
+		t.stdGhostLru.PushFront(node)
 	} else {
-		t.lru.PushFront(node)
+		t.stdLru.PushFront(node)
 	}
 }
 
 func (t *ImmutableTree) MoveToFront(node *Node) {
 	if node.ghost {
-		t.ghostLru.MoveToFront(node)
+		t.stdGhostLru.MoveToFront(node)
 	} else {
-		t.lru.MoveToFront(node)
+		t.stdLru.MoveToFront(node)
 	}
 }
 
 func (t *ImmutableTree) Unlink(node *Node) {
 	if node.ghost {
-		t.ghostLru.Unlink(node)
+		t.stdGhostLru.Remove(node)
 	} else {
-		t.lru.Unlink(node)
+		t.stdLru.Remove(node)
 	}
+}
+
+func (t *ImmutableTree) StdMergeGhosts() {
+	maxGhosts := t.stdLru.capacity / 2
+	if t.stdGhostLru.l.Len() == 0 {
+		return
+	}
+	newLru := newStdLru(t.stdLru.capacity)
+
+	lastPick := 0
+	g := t.stdGhostLru.l.Front()
+	m := t.stdLru.l.Front()
+	var n *Node
+	next := func() {
+		if g == nil && m == nil {
+			n = nil
+			return
+		}
+		// look ahead
+		if g == nil {
+			n = m.Value.(*Node)
+			m = m.Next()
+			return
+		}
+		if m == nil {
+			n = g.Value.(*Node)
+			n.ghost = false
+			g = g.Next()
+			return
+		}
+		if lastPick == 0 {
+			n = m.Value.(*Node)
+			m = m.Next()
+			lastPick = 1
+		} else {
+			n = g.Value.(*Node)
+			n.ghost = false
+			g = g.Next()
+			lastPick = 0
+		}
+	}
+
+	ghostCount := 0
+	for next(); n != nil; next() {
+		if n.ghost {
+			if ghostCount > maxGhosts {
+				n.onEvict(n)
+			} else {
+				newLru.PushFront(n)
+			}
+			n.ghost = false
+			ghostCount++
+		} else {
+			newLru.PushFront(n)
+		}
+	}
+
+	t.stdLru = newLru
+	t.stdGhostLru = newStdLru(t.stdGhostLru.capacity)
 }
 
 func (t *ImmutableTree) MergeGhosts() {
