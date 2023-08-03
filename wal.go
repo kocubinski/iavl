@@ -271,7 +271,9 @@ func (r *Wal) Checkpoint(index uint64, version int64, cache NodeCache) error {
 		if err != nil {
 			return err
 		}
-		cache.Add(k, dn.node)
+		//cache.Add(k, dn.node)
+		// danger?
+		dn.node.ghost = false
 		buf.Reset()
 		setCount++
 	}

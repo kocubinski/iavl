@@ -22,6 +22,17 @@ type ImmutableTree struct {
 	ndb                    *nodeDB
 	version                int64
 	skipFastStorageUpgrade bool
+
+	lruHead   *Node
+	lruTail   *Node
+	lruLength int
+
+	ghostLruHead   *Node
+	ghostLruTail   *Node
+	ghostLruLength int
+
+	lruSize        int
+	lruSearchDepth int
 }
 
 // NewImmutableTree creates both in-memory and persistent instances
@@ -319,6 +330,11 @@ func (t *ImmutableTree) clone() *ImmutableTree {
 		nodeBackened:           t.nodeBackened,
 		version:                t.version,
 		skipFastStorageUpgrade: t.skipFastStorageUpgrade,
+		lruSize:                t.lruSize,
+		lruLength:              t.lruLength,
+		lruHead:                t.lruHead,
+		lruTail:                t.lruTail,
+		lruSearchDepth:         t.lruSearchDepth,
 	}
 }
 

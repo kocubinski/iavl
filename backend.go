@@ -7,7 +7,6 @@ import (
 
 	dbm "github.com/cosmos/cosmos-db"
 	"github.com/gogo/protobuf/proto"
-	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 type NodeBackend interface {
@@ -22,141 +21,6 @@ type NodeBackend interface {
 
 	GetNode(nodeKey []byte) (*Node, error)
 }
-
-type NodeCache interface {
-	Add(nodeCacheKey, *Node)
-	Remove(nodeCacheKey)
-	Size() int
-	Get(nodeCacheKey) (*Node, bool)
-}
-
-var _ NodeCache = (*NodeLruCache)(nil)
-
-type NodeLruCache struct {
-	cache *lru.Cache[nodeCacheKey, *Node]
-}
-
-func (c *NodeLruCache) Add(nk nodeCacheKey, node *Node) {
-	c.cache.Add(nk, node)
-}
-
-func (c *NodeLruCache) Get(nk nodeCacheKey) (*Node, bool) {
-	return c.cache.Get(nk)
-}
-
-func (c *NodeLruCache) Remove(nk nodeCacheKey) {
-	c.cache.Remove(nk)
-}
-
-func (c *NodeLruCache) Size() int {
-	return c.cache.Len()
-}
-
-func NewNodeLruCache(size int) *NodeLruCache {
-	cache, err := lru.New[nodeCacheKey, *Node](size)
-	if err != nil {
-		panic(err)
-	}
-	return &NodeLruCache{
-		cache: cache,
-	}
-}
-
-var _ NodeCache = (*NodeMapCache)(nil)
-
-type NodeMapCache struct {
-	cache map[nodeCacheKey]*Node
-}
-
-func (c *NodeMapCache) Add(nk nodeCacheKey, node *Node) {
-	c.cache[nk] = node
-}
-
-func (c *NodeMapCache) Get(nk nodeCacheKey) (*Node, bool) {
-	node, ok := c.cache[nk]
-	return node, ok
-}
-
-func (c *NodeMapCache) Remove(nk nodeCacheKey) {
-	delete(c.cache, nk)
-}
-
-func (c *NodeMapCache) Size() int {
-	return len(c.cache)
-}
-
-var _ NodeBackend = (*MapDB)(nil)
-
-type MapDB struct {
-	nodes map[[12]byte]*Node
-	add   []*Node
-	del   []*Node
-
-	// simulation
-	walBuf *bytes.Buffer
-}
-
-func NewMapDB() *MapDB {
-	return &MapDB{
-		nodes: make(map[[12]byte]*Node),
-	}
-}
-
-func (m *MapDB) QueueNode(node *Node) error {
-	// var nk [12]byte
-	// copy(nk[:], node.nodeKey.GetKey())
-	// m.nodes[nk] = node
-	m.add = append(m.add, node)
-	return nil
-}
-
-func (m *MapDB) QueueOrphan(node *Node) error {
-	// var nk [12]byte
-	// copy(nk[:], node.nodeKey.GetKey())
-	// delete(m.nodes, nk)
-	m.del = append(m.del, node)
-	return nil
-}
-
-func (m *MapDB) Commit(version int64) error {
-	for _, node := range m.add {
-		var nk [12]byte
-		copy(nk[:], node.nodeKey.GetKey())
-		m.nodes[nk] = node
-	}
-	for _, node := range m.del {
-		var nk [12]byte
-		copy(nk[:], node.nodeKey.GetKey())
-		delete(m.nodes, nk)
-	}
-	m.add = nil
-	m.del = nil
-	return nil
-}
-
-func (m *MapDB) GetNode(nodeKey []byte) (*Node, error) {
-	var nk [12]byte
-	copy(nk[:], nodeKey)
-	n, ok := m.nodes[nk]
-	if !ok {
-		return nil, fmt.Errorf("MapDB: node not found")
-	}
-	return n, nil
-}
-
-var _ NodeBackend = (*NopBackend)(nil)
-
-type NopBackend struct{}
-
-func (n NopBackend) QueueNode(*Node) error { return nil }
-
-func (n NopBackend) QueueOrphan(*Node) error { return nil }
-
-func (n NopBackend) Commit(int64) error { return nil }
-
-func (n NopBackend) GetNode([]byte) (*Node, error) { return nil, nil }
-
-type nodeCacheKey [12]byte
 
 var _ NodeBackend = (*KeyValueBackend)(nil)
 
@@ -187,15 +51,15 @@ func NewKeyValueBackend(db dbm.DB, cacheSize int, wal *Wal) (*KeyValueBackend, e
 		walIdx = 1
 	}
 
-	lruCache := NewNodeLruCache(cacheSize)
+	//lruCache := NewNodeLruCache(cacheSize)
 
 	return &KeyValueBackend{
 		db:     db,
 		wal:    wal,
 		walIdx: walIdx,
 		//nodeCache: &NodeMapCache{cache: make(map[nodeCacheKey]*Node)},
-		nodeCache: lruCache,
-		walBuf:    new(bytes.Buffer),
+		//nodeCache: lruCache,
+		walBuf: new(bytes.Buffer),
 	}, nil
 }
 
@@ -240,10 +104,10 @@ func (kv *KeyValueBackend) Commit(version int64) error {
 		changeset.Pairs = append(changeset.Pairs, &KVPair{Key: node.key, Value: node.value, Delete: true})
 		dn := &deferredNode{nodeKey: nk, deleted: true, node: node}
 		kv.wal.CachePut(dn)
-		kv.nodeCache.Remove(nk)
+		//kv.nodeCache.Remove(nk)
 	}
 
-	if kv.MetricCacheSize != nil {
+	if kv.MetricCacheSize != nil && kv.nodeCache != nil {
 		kv.MetricCacheSize.Set(float64(kv.nodeCache.Size()))
 	}
 
@@ -279,6 +143,9 @@ func (kv *KeyValueBackend) Commit(version int64) error {
 }
 
 func (kv *KeyValueBackend) GetNode(nodeKey []byte) (*Node, error) {
+	if kv.nodeCache == nil {
+		panic("GetNode should be be called in this configuration")
+	}
 	var nk nodeCacheKey
 	copy(nk[:], nodeKey)
 

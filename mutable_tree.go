@@ -59,7 +59,11 @@ func NewMutableTree(db dbm.DB, cacheSize int, skipFastStorageUpgrade bool, lg lo
 // NewMutableTreeWithOpts returns a new tree with the specified options.
 func NewMutableTreeWithOpts(db dbm.DB, cacheSize int, opts *Options, skipFastStorageUpgrade bool, lg log.Logger) *MutableTree {
 	ndb := newNodeDB(db, cacheSize, opts, lg)
-	head := &ImmutableTree{ndb: ndb, skipFastStorageUpgrade: skipFastStorageUpgrade}
+	head := &ImmutableTree{
+		ndb:                    ndb,
+		skipFastStorageUpgrade: skipFastStorageUpgrade,
+		lruSize:                1_000_000,
+	}
 	var nopMode bool
 	if opts != nil {
 		head.nodeBackened = opts.NodeBackend
@@ -67,6 +71,8 @@ func NewMutableTreeWithOpts(db dbm.DB, cacheSize int, opts *Options, skipFastSto
 			nopMode = true
 		}
 	}
+	// TODO
+	nopMode = true
 
 	return &MutableTree{
 		logger:                   lg,
@@ -266,7 +272,7 @@ func (tree *MutableTree) set(key []byte, value []byte) (updated bool, err error)
 		if !tree.skipFastStorageUpgrade {
 			tree.addUnsavedAddition(key, fastnode.NewNode(key, value, tree.version+1))
 		}
-		tree.ImmutableTree.root = NewNode(key, value)
+		tree.ImmutableTree.root = tree.ImmutableTree.NewGhostNode(key, value)
 		return updated, nil
 	}
 
@@ -279,55 +285,80 @@ func (tree *MutableTree) recursiveSet(node *Node, key []byte, value []byte) (
 ) {
 	version := tree.version + 1
 
-	if node == nil {
-		fmt.Println("bad")
-	}
-
 	if node.isLeaf() {
 		if !tree.skipFastStorageUpgrade {
 			tree.addUnsavedAddition(key, fastnode.NewNode(key, value, version))
 		}
 		switch bytes.Compare(key, node.key) {
 		case -1: // setKey < leafKey
-			return &Node{
+			n := &Node{
 				key:           node.key,
 				subtreeHeight: 1,
 				size:          2,
 				nodeKey:       nil,
-				leftNode:      NewNode(key, value),
+				leftNode:      tree.NewGhostNode(key, value),
 				rightNode:     node,
-			}, false, nil
+				ghost:         true,
+			}
+			n.leftNode.onEvict = func() {
+				n.leftNode = nil
+			}
+			n.rightNode.onEvict = func() {
+				n.rightNode = nil
+			}
+			tree.PushFront(n)
+			return n, false, nil
 		case 1: // setKey > leafKey
-			return &Node{
+			n := &Node{
 				key:           key,
 				subtreeHeight: 1,
 				size:          2,
 				nodeKey:       nil,
 				leftNode:      node,
-				rightNode:     NewNode(key, value),
-			}, false, nil
+				rightNode:     tree.NewGhostNode(key, value),
+				ghost:         true,
+			}
+			n.leftNode.onEvict = func() {
+				n.leftNode = nil
+			}
+			n.rightNode.onEvict = func() {
+				n.rightNode = nil
+			}
+			tree.PushFront(n)
+			return n, false, nil
 		default:
 			if err := tree.addOrphan(node); err != nil {
 				return nil, false, err
 			}
-			return NewNode(key, value), true, nil
+			n := tree.NewGhostNode(key, value)
+			return n, true, nil
 		}
 	} else {
 		if err := tree.addOrphan(node); err != nil {
 			return nil, false, err
 		}
-		node, err = node.clone(tree)
+		err = node.fade()
 		if err != nil {
 			return nil, false, err
 		}
 
 		if bytes.Compare(key, node.key) < 0 {
 			node.leftNode, updated, err = tree.recursiveSet(node.leftNode, key, value)
+			if node.leftNode.ghost {
+				node.leftNode.onEvict = func() {
+					node.leftNode = nil
+				}
+			}
 			if err != nil {
 				return nil, updated, err
 			}
 		} else {
 			node.rightNode, updated, err = tree.recursiveSet(node.rightNode, key, value)
+			if node.rightNode.ghost {
+				node.rightNode.onEvict = func() {
+					node.rightNode = nil
+				}
+			}
 			if err != nil {
 				return nil, updated, err
 			}
@@ -383,12 +414,13 @@ func (tree *MutableTree) recursiveRemove(node *Node, key []byte) (newSelf *Node,
 	}
 	if node.isLeaf() {
 		if bytes.Equal(key, node.key) {
+			tree.Unlink(node)
 			return nil, nil, node.value, true, nil
 		}
 		return node, nil, nil, false, nil
 	}
 
-	node, err = node.clone(tree)
+	err = node.fade()
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -914,7 +946,7 @@ func (tree *MutableTree) DeleteVersionsTo(toVersion int64) error {
 func (tree *MutableTree) rotateRight(node *Node) (*Node, error) {
 	var err error
 	// TODO: optimize balance & rotate.
-	node, err = node.clone(tree)
+	err = node.fade()
 	if err != nil {
 		return nil, err
 	}
@@ -922,13 +954,20 @@ func (tree *MutableTree) rotateRight(node *Node) (*Node, error) {
 	if err = tree.addOrphan(node.leftNode); err != nil {
 		return nil, err
 	}
-	newNode, err := node.leftNode.clone(tree)
+	err = node.leftNode.fade()
 	if err != nil {
 		return nil, err
 	}
+	newNode := node.leftNode
 
 	node.leftNode = newNode.rightNode
 	newNode.rightNode = node
+	newNode.rightNode.onEvict = func() {
+		node.leftNode = nil
+	}
+	node.onEvict = func() {
+		newNode.rightNode = nil
+	}
 
 	err = node.calcHeightAndSize(tree.ImmutableTree)
 	if err != nil {
@@ -947,7 +986,7 @@ func (tree *MutableTree) rotateRight(node *Node) (*Node, error) {
 func (tree *MutableTree) rotateLeft(node *Node) (*Node, error) {
 	var err error
 	// TODO: optimize balance & rotate.
-	node, err = node.clone(tree)
+	err = node.fade()
 	if err != nil {
 		return nil, err
 	}
@@ -955,13 +994,20 @@ func (tree *MutableTree) rotateLeft(node *Node) (*Node, error) {
 	if err = tree.addOrphan(node.rightNode); err != nil {
 		return nil, err
 	}
-	newNode, err := node.rightNode.clone(tree)
+	err = node.rightNode.fade()
 	if err != nil {
 		return nil, err
 	}
 
+	newNode := node.rightNode
 	node.rightNode = newNode.leftNode
 	newNode.leftNode = node
+	newNode.leftNode.onEvict = func() {
+		node.rightNode = nil
+	}
+	node.onEvict = func() {
+		newNode.leftNode = nil
+	}
 
 	err = node.calcHeightAndSize(tree.ImmutableTree)
 	if err != nil {

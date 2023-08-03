@@ -57,18 +57,35 @@ func GetRootKey(version int64) []byte {
 	return b
 }
 
+type lruNode struct {
+	prev  *Node
+	next  *Node
+	ghost bool
+}
+
 // Node represents a node in a Tree.
 type Node struct {
-	key           []byte
-	value         []byte
-	hash          []byte
-	nodeKey       *NodeKey
-	leftNodeKey   []byte
-	rightNodeKey  []byte
-	size          int64
-	leftNode      *Node
-	rightNode     *Node
-	subtreeHeight int8
+	// persistent fields
+	key                []byte
+	value              []byte
+	hash               []byte
+	nodeKey            *NodeKey
+	leftNodeKey        []byte
+	rightNodeKey       []byte
+	size               int64
+	subtreeHeight      int8
+	persistentRefCount int8
+
+	// transient fields
+	leftNode          *Node
+	rightNode         *Node
+	transientRefCount byte
+	// TODO move to GhostNode
+	// lru
+	prev    *Node
+	next    *Node
+	ghost   bool
+	onEvict func()
 }
 
 var _ cache.Node = (*Node)(nil)
@@ -285,6 +302,16 @@ func (node *Node) String() string {
 		node.size, node.subtreeHeight, child)
 }
 
+func (node *Node) fade() error {
+	if node.IsLeaf() {
+		return fmt.Errorf("won't fade a leaf node")
+	}
+	node.ghost = true
+	node.nodeKey = nil
+	node.hash = nil
+	return nil
+}
+
 // clone creates a shallow copy of a node with its hash set to nil.
 func (node *Node) clone(tree *MutableTree) (*Node, error) {
 	if node.isLeaf() {
@@ -321,6 +348,8 @@ func (node *Node) clone(tree *MutableTree) (*Node, error) {
 		rightNodeKey:  node.rightNodeKey,
 		leftNode:      leftNode,
 		rightNode:     rightNode,
+		onEvict:       node.onEvict,
+		ghost:         true,
 	}, nil
 }
 
@@ -660,6 +689,7 @@ func (node *Node) writeBytes(w io.Writer) error {
 
 func (node *Node) getLeftNode(t *ImmutableTree) (*Node, error) {
 	if node.leftNode != nil {
+		t.MoveToFront(node.leftNode)
 		return node.leftNode, nil
 	}
 	var leftNode *Node
@@ -675,11 +705,18 @@ func (node *Node) getLeftNode(t *ImmutableTree) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	leftNode.onEvict = func() {
+		node.leftNode = nil
+	}
+	t.PushFront(leftNode)
+
 	return leftNode, nil
 }
 
 func (node *Node) getRightNode(t *ImmutableTree) (*Node, error) {
 	if node.rightNode != nil {
+		t.MoveToFront(node.rightNode)
 		return node.rightNode, nil
 	}
 	var rightNode *Node
@@ -692,6 +729,12 @@ func (node *Node) getRightNode(t *ImmutableTree) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	rightNode.onEvict = func() {
+		node.rightNode = nil
+	}
+	t.PushFront(rightNode)
+
 	return rightNode, nil
 }
 
