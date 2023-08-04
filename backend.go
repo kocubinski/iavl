@@ -84,10 +84,6 @@ func (kv *KeyValueBackend) Commit(version int64) error {
 
 	changeset := &ChangeSet{}
 	for _, node := range kv.nodes {
-		//nodeBz, err := WriteWalNode(kv.walBuf, node, 0)
-		//if err != nil {
-		//	return err
-		//}
 		changeset.Pairs = append(changeset.Pairs, &KVPair{Key: node.key, Value: node.value})
 
 		copy(nk[:], node.nodeKey.GetKey())
@@ -96,15 +92,10 @@ func (kv *KeyValueBackend) Commit(version int64) error {
 	}
 
 	for _, node := range kv.orphans {
-		//nodeBz, err := WriteWalNode(kv.walBuf, node, 1)
-		//if err != nil {
-		//	return err
-		//}
 		copy(nk[:], node.nodeKey.GetKey())
 		changeset.Pairs = append(changeset.Pairs, &KVPair{Key: node.key, Value: node.value, Delete: true})
 		dn := &deferredNode{nodeKey: nk, deleted: true, node: node}
 		kv.wal.CachePut(dn)
-		//kv.nodeCache.Remove(nk)
 	}
 
 	if kv.MetricCacheSize != nil && kv.nodeCache != nil {
@@ -189,6 +180,10 @@ func (kv *KeyValueBackend) GetNode(nodeKey []byte) (*Node, error) {
 		return nil, fmt.Errorf("kv/GetNode/MakeNode; nodeKey: %s [%X]; bytes: %X; %w",
 			GetNodeKey(nodeKey), nodeKey, value, err)
 	}
-	kv.nodeCache.Add(nk, node)
+
+	if kv.nodeCache != nil {
+		kv.nodeCache.Add(nk, node)
+	}
+
 	return node, nil
 }

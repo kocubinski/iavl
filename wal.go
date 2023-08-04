@@ -204,7 +204,6 @@ func (r *Wal) CachePut(node *deferredNode) {
 	r.cacheLock.Unlock()
 
 	nk := node.nodeKey
-
 	if !node.deleted {
 		cache.puts[nk] = node
 	} else {
@@ -248,7 +247,7 @@ func (r *Wal) CheckpointRunner(ctx context.Context) error {
 				r.hotCache, r.coldCache = r.coldCache, r.hotCache
 				r.hotCache.sinceVersion = args.version + 1
 				r.cacheLock.Unlock()
-				err := r.Checkpoint(args.index, args.version, args.cache)
+				err := r.Checkpoint(args.index, args.version, true)
 				if err != nil {
 					return err
 				}
@@ -257,10 +256,14 @@ func (r *Wal) CheckpointRunner(ctx context.Context) error {
 	}
 }
 
-func (r *Wal) Checkpoint(index uint64, version int64, cache NodeCache) error {
-	// TODO: IMPORTANT: change this coldCatch for async checkpointing
-	// ideally this is managed by configuration
-	wcache := r.hotCache
+func (r *Wal) Checkpoint(index uint64, version int64, async bool) error {
+	var wcache *walCache
+	if async {
+		wcache = r.coldCache
+	} else {
+		wcache = r.hotCache
+	}
+
 	start := time.Now()
 	setCount := 0
 	deleteCount := 0
@@ -272,6 +275,7 @@ func (r *Wal) Checkpoint(index uint64, version int64, cache NodeCache) error {
 		if err != nil {
 			return err
 		}
+
 		err = r.commitment.Set(k[:], buf.Bytes())
 		if err != nil {
 			return err
@@ -290,18 +294,19 @@ func (r *Wal) Checkpoint(index uint64, version int64, cache NodeCache) error {
 		return err
 	}
 
-	// TODO: for async commit
-	//r.cacheLock.Lock()
-	//r.coldCache = &walCache{
-	//	puts:    make(map[nodeCacheKey]*deferredNode),
-	//	deletes: []*deferredNode{},
-	//}
-	//r.cacheLock.Unlock()
-	// TODO: delete from async commit
-	r.hotCache = &walCache{
-		puts:         make(map[nodeCacheKey]*deferredNode),
-		deletes:      []*deferredNode{},
-		sinceVersion: version + 1,
+	if async {
+		r.cacheLock.Lock()
+		r.coldCache = &walCache{
+			puts:    make(map[nodeCacheKey]*deferredNode),
+			deletes: []*deferredNode{},
+		}
+		r.cacheLock.Unlock()
+	} else {
+		r.hotCache = &walCache{
+			puts:         make(map[nodeCacheKey]*deferredNode),
+			deletes:      []*deferredNode{},
+			sinceVersion: version + 1,
+		}
 	}
 
 	//if r.MetricWalSize != nil {
@@ -328,7 +333,7 @@ func (r *Wal) MaybeCheckpoint(index uint64, version int64, cache NodeCache) erro
 	}
 
 	if index-r.checkpointHead >= uint64(r.checkpointInterval) {
-		return r.Checkpoint(index, version, cache)
+		return r.Checkpoint(index, version, false)
 	}
 
 	return nil

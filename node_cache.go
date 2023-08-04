@@ -372,19 +372,28 @@ func (t *ImmutableTree) NewGhostNode(key []byte, value []byte) *Node {
 }
 
 func (node *Node) SetEvictLeft() {
+	if node.leftNode == nil {
+		panic("left node is nil")
+	}
 	// node is the parent
 	node.leftNode.onEvict = func(e *Node) {
 		// if the child is still the same, remove the ref
-		if e == nil && e == node.leftNode {
+		if e != nil && e == node.leftNode {
+			if e.nodeKey.String() == "(79859, 2)" {
+				println("evicting (79859, 2)")
+			}
 			node.leftNode = nil
 		}
 	}
 }
 
 func (node *Node) SetEvictRight() {
+	if node.rightNode == nil {
+		panic("right node is nil")
+	}
 	// node is the parent
 	node.rightNode.onEvict = func(e *Node) {
-		if e == nil && e == node.rightNode {
+		if e != nil && e == node.rightNode {
 			node.rightNode = nil
 		}
 	}

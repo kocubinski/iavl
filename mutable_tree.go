@@ -1104,6 +1104,9 @@ func (tree *MutableTree) saveNewNodes(version int64) error {
 	newNodes := make([]*Node, 0)
 	var recursiveAssignKey func(*Node) ([]byte, error)
 	recursiveAssignKey = func(node *Node) ([]byte, error) {
+		if node == nil {
+			panic("recursiveAssignKey: node is nil")
+		}
 		if node.hash != nil {
 			if node.nodeKey.nonce != 0 {
 				return node.nodeKey.GetKey(), nil
@@ -1176,9 +1179,9 @@ func (tree *MutableTree) getLeftNode(node *Node) *Node {
 		panic(err)
 	}
 
+	node.leftNode = leftNode
 	node.SetEvictLeft()
 	tree.PushFront(leftNode)
-	node.leftNode = leftNode
 	return leftNode
 }
 
@@ -1201,9 +1204,9 @@ func (tree *MutableTree) getRightNode(node *Node) *Node {
 		panic(err)
 	}
 
+	node.rightNode = rightNode
 	node.SetEvictRight()
 	tree.PushFront(rightNode)
-	node.rightNode = rightNode
 	return rightNode
 }
 
@@ -1212,7 +1215,7 @@ func (tree *MutableTree) addOrphan(orphan *Node) error {
 		return nil
 	}
 	if tree.nodeBackened != nil {
-		return tree.nodeBackened.QueueOrphan(orphan)
+		return tree.nodeBackened.QueueOrphan(&Node{nodeKey: orphan.nodeKey})
 	}
 	return nil
 }
