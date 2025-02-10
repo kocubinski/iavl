@@ -1,17 +1,16 @@
-// TODO move to package iavl_test
-// this means an audit of exported fields and types.
 package iavl
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"github.com/cosmos/iavl/v2/metrics"
 	"os"
 	"sort"
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/cosmos/iavl/v2/metrics"
 
 	"github.com/cosmos/iavl-bench/bench"
 	"github.com/cosmos/iavl/v2/testutil"
@@ -106,7 +105,9 @@ func TestTree_Build_Load(t *testing.T) {
 	// build the initial version of the tree with periodic checkpoints
 	tmpDir := t.TempDir()
 	opts := testutil.NewTreeBuildOptions().With10_000()
-	mt := NewMultiTree(tmpDir, TreeOptions{CheckpointInterval: 4000, HeightFilter: 0, StateStorage: false})
+	mt := NewMultiTree(tmpDir, TreeOptions{
+		CheckpointInterval: 4000, HeightFilter: 0, StateStorage: false, MetricsProxy: metrics.NewStructMetrics(),
+	})
 	itrs, ok := opts.Iterator.(*bench.ChangesetIterators)
 	require.True(t, ok)
 	for _, sk := range itrs.StoreKeys() {
@@ -121,7 +122,9 @@ func TestTree_Build_Load(t *testing.T) {
 	require.NoError(t, mt.Close())
 
 	t.Log("import snapshot into new tree")
-	mt, err := ImportMultiTree(mt.pool, 10_000, tmpDir, DefaultTreeOptions())
+	treeOpts := DefaultTreeOptions()
+	treeOpts.MetricsProxy = metrics.NewStructMetrics()
+	mt, err := ImportMultiTree(mt.pool, 10_000, tmpDir, treeOpts)
 	require.NoError(t, err)
 
 	t.Log("build tree to version 12,000 and verify hash")
@@ -132,56 +135,6 @@ func TestTree_Build_Load(t *testing.T) {
 	mt.TestBuild(t, opts)
 	require.NoError(t, mt.Close())
 }
-
-// func TestOsmoLike_HotStart(t *testing.T) {
-// 	tmpDir := "/Users/mattk/.costor/iavl-v2"
-// 	logDir := "/Users/mattk/src/devmos/osmo-like-many/v2"
-
-// 	pool := NewNodePool()
-// 	multiTree, err := ImportMultiTree(pool, 1, tmpDir, TreeOptions{
-// 		HeightFilter:       0,
-// 		StateStorage:       false,
-// 		CheckpointInterval: 1001,
-// 	})
-// 	require.NoError(t, err)
-// 	require.NotNil(t, multiTree)
-// 	opts := testutil.CompactedChangelogs(logDir)
-// 	opts.SampleRate = 250_000
-
-// 	// opts.Until = 1_000
-// 	// opts.UntilHash = "557663181d9ab97882ecfc6538e3b4cfe31cd805222fae905c4b4f4403ca5cda"
-// 	opts.Until = 500
-// 	opts.UntilHash = "2670bd5767e70f2bf9e4f723b5f205759e39afdb5d8cfb6b54a4a3ecc27a1377"
-
-// 	multiTree.TestBuild(t, opts)
-// }
-
-// func TestOsmoLike_ColdStart(t *testing.T) {
-// 	tmpDir := "/tmp/iavl-v2"
-// 	logDir := "/Users/mattk/src/devmos/osmo-like-many/v2"
-
-// 	treeOpts := DefaultTreeOptions()
-// 	treeOpts.CheckpointInterval = 50
-// 	// treeOpts.CheckpointMemory = 1.5 * 1024 * 1024 * 1024
-// 	treeOpts.StateStorage = true
-// 	treeOpts.HeightFilter = 1
-// 	// treeOpts.EvictionDepth = 22
-// 	treeOpts.MetricsProxy = newPrometheusMetricsProxy()
-// 	multiTree := NewMultiTree(tmpDir, treeOpts)
-// 	require.NoError(t, multiTree.MountTrees())
-// 	require.NoError(t, multiTree.LoadVersion(1))
-// 	require.NoError(t, multiTree.WarmLeaves())
-
-// 	opts := testutil.CompactedChangelogs(logDir)
-// 	opts.SampleRate = 250_000
-
-// 	// opts.Until = 1_000
-// 	// opts.UntilHash = "557663181d9ab97882ecfc6538e3b4cfe31cd805222fae905c4b4f4403ca5cda"
-// 	opts.Until = 500
-// 	opts.UntilHash = "2670bd5767e70f2bf9e4f723b5f205759e39afdb5d8cfb6b54a4a3ecc27a1377"
-
-// 	multiTree.TestBuild(t, opts)
-// }
 
 func TestTreeSanity(t *testing.T) {
 	cases := []struct {

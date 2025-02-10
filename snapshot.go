@@ -72,7 +72,7 @@ func (sql *SqliteDb) Snapshot(ctx context.Context, tree *Tree) (topErr error) {
 	if err = snapshot.prepareWrite(); err != nil {
 		return err
 	}
-	if err = snapshot.writeStep(tree.root); err != nil {
+	if err = snapshot.writeStep(tree.stagedRoot); err != nil {
 		return err
 	}
 	if err = snapshot.flush(); err != nil {

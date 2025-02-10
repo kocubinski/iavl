@@ -1027,14 +1027,13 @@ func (sql *SqliteDb) replayChangelog(tree *Tree, toVersion int64, targetHash []b
 		return fmt.Errorf("root hash mismatch; expected %x got %x; path=%s count=%d",
 			targetHash, rootHash, sql.opts.Path, count)
 	}
-	if err = tree.evictNodes(); err != nil {
-		return err
-	}
+
 	tree.leaves, tree.leafOrphans, tree.deletes = nil, nil, nil
 	tree.resetSequence()
 	tree.version = toVersion
 	tree.stagedVersion = toVersion + 1
 	tree.root = tree.stagedRoot
+
 	lg.Info().Msgf("replayed changelog to version=%d count=%s dur=%s root=%v hash=%x",
 		tree.version, humanize.Comma(count), time.Since(start).Round(time.Millisecond), tree.root, rootHash)
 	return cf.close()

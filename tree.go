@@ -72,7 +72,6 @@ type Tree struct {
 
 	// state
 	*writeQueue
-	evictions      []*Node
 	branchSequence uint32
 	leafSequence   uint32
 	evictionDepth  int8
@@ -119,7 +118,7 @@ func DefaultTreeOptions() TreeOptions {
 		HeightFilter:        1,
 		EvictionDepth:       -1,
 		PruneRatio:          1,
-		MinimumKeepVersions: 100,
+		MinimumKeepVersions: 2,
 		MetricsProxy:        &metrics.NilMetrics{},
 	}
 }
@@ -205,7 +204,10 @@ func (tree *Tree) LoadVersion(version int64) (err error) {
 	if err != nil {
 		return err
 	}
-	tree.stagedRoot = tree.root
+	if tree.root != nil {
+		stagedRoot := *tree.root
+		tree.stagedRoot = &stagedRoot
+	}
 	tree.pruneTo, tree.orphanBranchCount, tree.orphanLeafCount, err = tree.sql.getCheckpointCounts(tree.version)
 	if err != nil {
 		return err
@@ -303,11 +305,6 @@ func (tree *Tree) SaveVersion() ([]byte, int64, error) {
 	tree.metricsProxy.MeasureSince(saveStart, metricsNamespace, "db_write")
 	tree.metricsProxy.IncrCounter(float32(len(tree.leaves)), metricsNamespace, "db_write_leaf")
 
-	// now that nodes have been written to storage, we can evict flagged nodes from memory
-	if err := tree.evictNodes(); err != nil {
-		return nil, tree.version, err
-	}
-
 	tree.leafOrphans = nil
 	tree.leaves = nil
 	tree.branches = nil
@@ -325,14 +322,12 @@ func (tree *Tree) SaveVersion() ([]byte, int64, error) {
 			tree.pruneTo = 0
 		}
 	}
-
 	tree.shouldCheckpoint = false
 	tree.previousRoot = tree.root
 	tree.root = tree.stagedRoot
 	tree.version++
 	tree.stagedVersion++
 	tree.versionLock.Unlock()
-
 	return rootHash, tree.version, nil
 }
 
@@ -395,29 +390,6 @@ func (tree *Tree) postCheckpoint() error {
 	return nil
 }
 
-func (tree *Tree) evictNodes() error {
-	for i, node := range tree.evictions {
-		switch node.evict {
-		case 1:
-			tree.returnNode(node.leftNode)
-			node.leftNode = nil
-		case 2:
-			tree.returnNode(node.rightNode)
-			node.rightNode = nil
-		case 3:
-			tree.returnNode(node.leftNode)
-			node.leftNode = nil
-			tree.returnNode(node.rightNode)
-			node.rightNode = nil
-		default:
-			return fmt.Errorf("unexpected eviction flag %d i=%d", node.evict, i)
-		}
-		node.evict = 0
-	}
-	tree.evictions = nil
-	return nil
-}
-
 // ComputeHash the node and its descendants recursively. This usually mutates all
 // descendant nodes. Returns the tree root node hash.
 // If the tree is empty (i.e. the node is nil), returns the hash of an empty input,
@@ -430,7 +402,7 @@ func (tree *Tree) computeHash() []byte {
 	return tree.stagedRoot.hash
 }
 
-func (tree *Tree) deepHash(node *Node, depth int8) {
+func (tree *Tree) deepHash(node *Node, depth int8) (evict bool) {
 	if node == nil {
 		panic(fmt.Sprintf("node is nil; sql.path=%s", tree.sql.opts.Path))
 	}
@@ -441,39 +413,29 @@ func (tree *Tree) deepHash(node *Node, depth int8) {
 		}
 
 		// always end recursion at a leaf
-		return
+		if tree.heightFilter > 0 {
+			node.evict = 1
+			return true
+		}
 	}
 
+	var evictLeft, evictRight bool
 	if node.hash == nil {
 		// When the child is a leaf, this will initiate a leafRead from storage for the sole purpose of producing a hash.
 		// Recall that a terminal tree node may have only updated one leaf this version.
 		// We can explore storing right/left hash in terminal tree nodes to avoid this, or changing the storage
 		// format to iavl v0 where left/right hash are stored in the node.
-		tree.deepHash(node.left(tree.sql, tree.sql.hotConnectionFactory), depth+1)
-		tree.deepHash(node.right(tree.sql, tree.sql.hotConnectionFactory), depth+1)
+		evictLeft = tree.deepHash(node.left(tree.sql, tree.sql.hotConnectionFactory), depth+1)
+		evictRight = tree.deepHash(node.right(tree.sql, tree.sql.hotConnectionFactory), depth+1)
 		node._hash()
 	} else if tree.shouldCheckpoint {
 		// when checkpointing traverse the entire tree to accumulate dirty branches and flag for eviction
 		// even if the node hash is already computed
 		if node.leftNode != nil {
-			tree.deepHash(node.leftNode, depth+1)
+			evictLeft = tree.deepHash(node.leftNode, depth+1)
 		}
 		if node.rightNode != nil {
-			tree.deepHash(node.rightNode, depth+1)
-		}
-	}
-
-	// leaf node eviction occurs every version
-	if tree.heightFilter > 0 {
-		novel := node.evict == 0
-		if node.leftNode != nil && node.leftNode.isLeaf() {
-			node.evict++
-		}
-		if node.rightNode != nil && node.rightNode.isLeaf() {
-			node.evict += 2
-		}
-		if novel && node.evict > 0 {
-			tree.evictions = append(tree.evictions, node)
+			evictRight = tree.deepHash(node.rightNode, depth+1)
 		}
 	}
 
@@ -483,23 +445,23 @@ func (tree *Tree) deepHash(node *Node, depth int8) {
 		}
 		// full tree eviction occurs only during checkpoints
 		if depth >= tree.evictionDepth {
-			novel := node.evict == 0
-			if node.leftNode != nil && node.evict%2 == 0 {
-				node.evict++
-			}
-			if node.rightNode != nil && node.evict < 2 {
-				node.evict += 2
-			}
-			if novel && node.evict > 0 {
-				tree.evictions = append(tree.evictions, node)
-			}
+			node.evict = 1
+			evict = true
 		}
 	}
+	if evictLeft {
+		node.leftNode = nil
+	}
+	if evictRight {
+		node.rightNode = nil
+	}
+
+	return evict
 }
 
 func (tree *Tree) getRecentRoot(version int64) (bool, *Node) {
-	tree.versionLock.RLock()
-	defer tree.versionLock.RUnlock()
+	// tree.versionLock.RLock()
+	// defer tree.versionLock.RUnlock()
 	var root Node
 
 	switch version {
@@ -938,10 +900,13 @@ func (tree *Tree) stageNode(node *Node) *Node {
 }
 
 func (tree *Tree) addOrphan(node *Node) {
-	if !node.isLeaf() && node.Version() <= tree.checkpoints.Last() {
-		tree.branchOrphans = append(tree.branchOrphans, node.nodeKey)
-		tree.orphanBranchCount++
-	} else if node.isLeaf() && !node.isDirty(tree) {
+	if !node.isLeaf() {
+		if node.Version() <= tree.checkpoints.Last() {
+			tree.branchOrphans = append(tree.branchOrphans, node.nodeKey)
+			tree.orphanBranchCount++
+		}
+	} else if !node.isDirty(tree) {
+		// a leaf node with a version less than the current version
 		tree.leafOrphans = append(tree.leafOrphans, node.nodeKey)
 		tree.orphanLeafCount++
 	}
