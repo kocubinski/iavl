@@ -6,14 +6,16 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cosmos/iavl/v2/metrics"
 	"github.com/dustin/go-humanize"
 )
 
 type sqliteBatch struct {
-	tree   *Tree
-	sql    *SqliteDb
-	size   int64
-	logger Logger
+	tree    *Tree
+	sql     *SqliteDb
+	size    int64
+	logger  Logger
+	metrics metrics.Proxy
 
 	treeCount int64
 	treeSince time.Time
@@ -153,8 +155,6 @@ func (b *sqliteBatch) treeMaybeCommit(shardID int64) (err error) {
 }
 
 func (b *sqliteBatch) saveLeaves() (int64, error) {
-	var byteCount int64
-
 	err := b.newChangeLogBatch()
 	if err != nil {
 		return 0, err
@@ -175,7 +175,6 @@ func (b *sqliteBatch) saveLeaves() (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		byteCount += int64(len(bz))
 		if _, err = b.leafInsert.Exec(leaf.nodeKey.Version(), int(leaf.nodeKey.Sequence()), bz); err != nil {
 			return 0, err
 		}
@@ -231,10 +230,10 @@ func (b *sqliteBatch) saveLeaves() (int64, error) {
 
 	_, err = tree.sql.leafWrite.ExecContext(context.Background(), "CREATE UNIQUE INDEX IF NOT EXISTS leaf_idx ON leaf (version, sequence)")
 	if err != nil {
-		return byteCount, err
+		return b.leafCount, err
 	}
 
-	return byteCount, nil
+	return b.leafCount, nil
 }
 
 func (b *sqliteBatch) isCheckpoint() bool {
