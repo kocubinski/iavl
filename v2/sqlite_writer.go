@@ -2,12 +2,12 @@ package iavl
 
 import (
 	"context"
+	dsql "database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"time"
 
-	"github.com/bvinc/go-sqlite-lite/sqlite3"
 	"github.com/dustin/go-humanize"
 )
 
@@ -79,27 +79,28 @@ func (w *sqlWriter) leafLoop(ctx context.Context) error {
 		pruneVersion     int64
 		nextPruneVersion int64
 		checkpoints      VersionRange
-		orphanQuery      *sqlite3.Stmt
-		deleteOrphan     *sqlite3.Stmt
-		deleteLeaf       *sqlite3.Stmt
+		orphanQuery      *dsql.Rows
+		deleteOrphan     *dsql.Stmt
+		deleteLeaf       *dsql.Stmt
+		pruneTx          *dsql.Tx
 		pruneCount       int64
 		pruneStartTime   time.Time
 		err              error
 	)
 
 	beginPruneBatch := func(pruneTo int64) error {
-		if err = w.sql.leafWrite.Begin(); err != nil {
+		if pruneTx, err = w.sql.leafWrite.BeginTx(context.Background(), &dsql.TxOptions{}); err != nil {
 			return fmt.Errorf("failed to begin leaf prune tx; %w", err)
 		}
-		orphanQuery, err = w.sql.leafWrite.Prepare(`SELECT version, sequence, ROWID FROM leaf_orphan WHERE at <= ?`, pruneTo)
+		orphanQuery, err = pruneTx.Query(`SELECT version, sequence, ROWID FROM leaf_orphan WHERE at <= ?`, pruneTo)
 		if err != nil {
 			return fmt.Errorf("failed to prepare leaf orphan query; %w", err)
 		}
-		deleteOrphan, err = w.sql.leafWrite.Prepare("DELETE FROM leaf_orphan WHERE ROWID = ?")
+		deleteOrphan, err = pruneTx.Prepare("DELETE FROM leaf_orphan WHERE ROWID = ?")
 		if err != nil {
 			return fmt.Errorf("failed to prepare leaf orphan delete; %w", err)
 		}
-		deleteLeaf, err = w.sql.leafWrite.Prepare("DELETE FROM leaf WHERE version = ? and sequence = ?")
+		deleteLeaf, err = pruneTx.Prepare("DELETE FROM leaf WHERE version = ? and sequence = ?")
 		if err != nil {
 			return fmt.Errorf("failed to prepare leaf delete; %w", err)
 		}
@@ -132,11 +133,11 @@ func (w *sqlWriter) leafLoop(ctx context.Context) error {
 			return err
 		}
 		orphanQuery = nil
-		if err = w.sql.leafWrite.Commit(); err != nil {
+		if err = pruneTx.Commit(); err != nil {
 			return err
 		}
 		w.logger.Debug(fmt.Sprintf("commit leaf prune count=%s", humanize.Comma(pruneCount)))
-		if err = w.sql.leafWrite.Exec("PRAGMA wal_checkpoint(RESTART)"); err != nil {
+		if _, err = w.sql.leafWrite.ExecContext(ctx, "PRAGMA wal_checkpoint(RESTART)"); err != nil {
 			return fmt.Errorf("failed to checkpoint; %w", err)
 		}
 
@@ -150,7 +151,8 @@ func (w *sqlWriter) leafLoop(ctx context.Context) error {
 		return nil
 	}
 	stepPruning := func() error {
-		hasRow, err := orphanQuery.Step()
+		hasRow := orphanQuery.Next()
+		err = orphanQuery.Err()
 		if err != nil {
 			return fmt.Errorf("failed to step leaf orphan query; %w", err)
 		}
@@ -165,10 +167,10 @@ func (w *sqlWriter) leafLoop(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			if err = deleteLeaf.Exec(version, sequence); err != nil {
+			if _, err = deleteLeaf.Exec(version, sequence); err != nil {
 				return err
 			}
-			if err = deleteOrphan.Exec(rowID); err != nil {
+			if _, err = deleteOrphan.Exec(rowID); err != nil {
 				return err
 			}
 			if pruneCount%pruneBatchSize == 0 {
@@ -183,7 +185,7 @@ func (w *sqlWriter) leafLoop(ctx context.Context) error {
 			if err = commitPrune(); err != nil {
 				return err
 			}
-			err = w.sql.leafWrite.Exec("DELETE FROM leaf_delete WHERE version < ?", pruneVersion)
+			_, err = w.sql.leafWrite.ExecContext(ctx, "DELETE FROM leaf_delete WHERE version < ?", pruneVersion)
 			if err != nil {
 				return fmt.Errorf("failed to prune leaf_delete; %w", err)
 			}
@@ -208,7 +210,7 @@ func (w *sqlWriter) leafLoop(ctx context.Context) error {
 		res := &saveResult{}
 		res.n, res.err = sig.batch.saveLeaves()
 		if sig.batch.isCheckpoint() {
-			if err = w.sql.leafWrite.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			if _, err = w.sql.leafWrite.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 				w.logger.Error("failed leaf wal_checkpoint", "error", err)
 			}
 		}
@@ -263,25 +265,27 @@ func (w *sqlWriter) treeLoop(ctx context.Context) error {
 		pruneVersion     int64
 		pruneCount       int64
 		pruneStartTime   time.Time
-		orphanQuery      *sqlite3.Stmt
+		orphanQuery      *dsql.Rows
 		// TODO use a map
 		deleteBranch func(shardId int64, version int64, sequence int) (err error)
-		deleteOrphan *sqlite3.Stmt
+		deleteOrphan *dsql.Stmt
+		pruneTx      *dsql.Tx
 	)
 	beginPruneBatch := func(version int64) (err error) {
-		if err = w.sql.treeWrite.Begin(); err != nil {
+		if pruneTx, err = w.sql.treeWrite.BeginTx(ctx, &dsql.TxOptions{}); err != nil {
 			return err
 		}
-		orphanQuery, err = w.sql.treeWrite.Prepare(
+		orphanQuery, err = pruneTx.Query(
 			"SELECT version, sequence, at, ROWID FROM orphan WHERE at <= ?", version)
 		if err != nil {
 			return fmt.Errorf("failed to prepare orphan query; %w", err)
 		}
 		deleteBranch = func(shardId int64, version int64, sequence int) (err error) {
-			return w.sql.treeWrite.Exec(
+			_, deleteErr := pruneTx.Exec(
 				fmt.Sprintf("DELETE FROM tree_%d WHERE version = ? AND sequence = ?", shardId), version, sequence)
+			return deleteErr
 		}
-		deleteOrphan, err = w.sql.treeWrite.Prepare("DELETE FROM orphan WHERE ROWID = ?")
+		deleteOrphan, err = pruneTx.Prepare("DELETE FROM orphan WHERE ROWID = ?")
 		if err != nil {
 			return fmt.Errorf("failed to prepare orphan delete; %w", err)
 		}
@@ -295,11 +299,11 @@ func (w *sqlWriter) treeLoop(ctx context.Context) error {
 		if err = deleteOrphan.Close(); err != nil {
 			return err
 		}
-		if err = w.sql.treeWrite.Commit(); err != nil {
+		if err = pruneTx.Commit(); err != nil {
 			return err
 		}
 		w.logger.Debug(fmt.Sprintf("commit tree prune count=%s", humanize.Comma(pruneCount)))
-		if err = w.sql.treeWrite.Exec("PRAGMA wal_checkpoint(RESTART)"); err != nil {
+		if _, err = w.sql.treeWrite.ExecContext(ctx, "PRAGMA wal_checkpoint(RESTART)"); err != nil {
 			return fmt.Errorf("failed to checkpoint; %w", err)
 		}
 		return nil
@@ -314,7 +318,7 @@ func (w *sqlWriter) treeLoop(ctx context.Context) error {
 			}
 		}
 		if sig.batch.isCheckpoint() {
-			if err := w.sql.treeWrite.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			if _, err := w.sql.treeWrite.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 				res.err = fmt.Errorf("failed tree checkpoint; %w", err)
 			}
 		}
@@ -332,7 +336,8 @@ func (w *sqlWriter) treeLoop(ctx context.Context) error {
 		return nil
 	}
 	stepPruning := func() error {
-		hasRow, err := orphanQuery.Step()
+		hasRow := orphanQuery.Next()
+		err := orphanQuery.Err()
 		if err != nil {
 			return fmt.Errorf("failed to step orphan query; %w", err)
 		}
@@ -355,7 +360,7 @@ func (w *sqlWriter) treeLoop(ctx context.Context) error {
 			if err = deleteBranch(shard, version, sequence); err != nil {
 				return fmt.Errorf("failed to delete from tree_%d count=%d; %w", shard, pruneCount, err)
 			}
-			if err = deleteOrphan.Exec(rowID); err != nil {
+			if _, err = deleteOrphan.Exec(rowID); err != nil {
 				return fmt.Errorf("failed to delete from orphan count=%d; %w", pruneCount, err)
 			}
 			if pruneCount%pruneBatchSize == 0 {
@@ -372,7 +377,7 @@ func (w *sqlWriter) treeLoop(ctx context.Context) error {
 			}
 
 			prevCheckpoint := checkpoints.FindPrevious(pruneVersion)
-			if err = w.sql.treeWrite.Exec("DELETE FROM root WHERE version < ?", prevCheckpoint); err != nil {
+			if _, err = w.sql.treeWrite.ExecContext(ctx, "DELETE FROM root WHERE version < ?", prevCheckpoint); err != nil {
 				return err
 			}
 

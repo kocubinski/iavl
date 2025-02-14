@@ -1,10 +1,10 @@
 package scan
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 
-	"github.com/bvinc/go-sqlite-lite/sqlite3"
 	"github.com/cosmos/iavl/v2"
 	"github.com/spf13/cobra"
 )
@@ -28,40 +28,24 @@ func probeCommand() *cobra.Command {
 			}
 			fn := f.Name()
 			fmt.Println("fn:", fn)
-			conn, err := sqlite3.Open(fn)
+			conn, err := sql.Open("sqlite", fn)
 			if err != nil {
 				return err
 			}
 
-			stmt, err := conn.Prepare("PRAGMA mmap_size=1000000000000")
+			_, err = conn.Exec("PRAGMA mmap_size=1000000000000")
 			if err != nil {
-				return err
-			}
-			_, err = stmt.Step()
-			if err != nil {
-				return err
-			}
-			if err = stmt.Close(); err != nil {
 				return err
 			}
 
-			stmt, err = conn.Prepare("PRAGMA mmap_size")
+			var sz string
+			row := conn.QueryRow("PRAGMA mmap_size")
+			err = row.Scan(&sz)
 			if err != nil {
 				return err
 			}
-			_, err = stmt.Step()
-			if err != nil {
-				return err
-			}
-			res, _, err := stmt.ColumnRawString(0)
-			if err != nil {
-				return err
-			}
-			fmt.Println("mmap:", res)
+			fmt.Println("mmap:", sz)
 
-			if err = stmt.Close(); err != nil {
-				return err
-			}
 			if err = conn.Close(); err != nil {
 				return err
 			}

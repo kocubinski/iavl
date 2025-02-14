@@ -34,7 +34,7 @@ func TestTree_Hash(t *testing.T) {
 	}
 
 	testStart := time.Now()
-	multiTree := NewMultiTree(NewTestLogger(), tmpDir, treeOpts)
+	multiTree := NewMultiTree(NewDebugLogger(), tmpDir, treeOpts)
 	itrs, ok := opts.Iterator.(*bench.ChangesetIterators)
 	require.True(t, ok)
 	for _, sk := range itrs.StoreKeys() {

@@ -1,10 +1,11 @@
 package iavl
 
 import (
+	"context"
+	dsql "database/sql"
 	"fmt"
 	"time"
 
-	"github.com/bvinc/go-sqlite-lite/sqlite3"
 	"github.com/dustin/go-humanize"
 )
 
@@ -19,36 +20,39 @@ type sqliteBatch struct {
 	leafCount int64
 	leafSince time.Time
 
-	leafInsert   *sqlite3.Stmt
-	deleteInsert *sqlite3.Stmt
-	latestInsert *sqlite3.Stmt
-	latestDelete *sqlite3.Stmt
-	treeInsert   *sqlite3.Stmt
-	leafOrphan   *sqlite3.Stmt
-	treeOrphan   *sqlite3.Stmt
+	treeTx       *dsql.Tx
+	leafTx       *dsql.Tx
+	leafInsert   *dsql.Stmt
+	deleteInsert *dsql.Stmt
+	latestInsert *dsql.Stmt
+	latestDelete *dsql.Stmt
+	treeInsert   *dsql.Stmt
+	leafOrphan   *dsql.Stmt
+	treeOrphan   *dsql.Stmt
 }
 
 func (b *sqliteBatch) newChangeLogBatch() (err error) {
-	if err = b.sql.leafWrite.Begin(); err != nil {
-		return err
-	}
-	b.leafInsert, err = b.sql.leafWrite.Prepare("INSERT OR REPLACE INTO leaf (version, sequence, bytes) VALUES (?, ?, ?)")
+	b.leafTx, err = b.sql.leafWrite.BeginTx(context.Background(), &dsql.TxOptions{})
 	if err != nil {
 		return err
 	}
-	b.deleteInsert, err = b.sql.leafWrite.Prepare("INSERT OR REPLACE INTO leaf_delete (version, sequence, key) VALUES (?, ?, ?)")
+	b.leafInsert, err = b.leafTx.Prepare("INSERT OR REPLACE INTO leaf (version, sequence, bytes) VALUES (?, ?, ?)")
 	if err != nil {
 		return err
 	}
-	b.latestInsert, err = b.sql.leafWrite.Prepare("INSERT OR REPLACE INTO latest (key, value) VALUES (?, ?)")
+	b.deleteInsert, err = b.leafTx.Prepare("INSERT OR REPLACE INTO leaf_delete (version, sequence, key) VALUES (?, ?, ?)")
 	if err != nil {
 		return err
 	}
-	b.latestDelete, err = b.sql.leafWrite.Prepare("DELETE FROM latest WHERE key = ?")
+	b.latestInsert, err = b.leafTx.Prepare("INSERT OR REPLACE INTO latest (key, value) VALUES (?, ?)")
 	if err != nil {
 		return err
 	}
-	b.leafOrphan, err = b.sql.leafWrite.Prepare("INSERT INTO leaf_orphan (version, sequence, at) VALUES (?, ?, ?)")
+	b.latestDelete, err = b.leafTx.Prepare("DELETE FROM latest WHERE key = ?")
+	if err != nil {
+		return err
+	}
+	b.leafOrphan, err = b.leafTx.Prepare("INSERT INTO leaf_orphan (version, sequence, at) VALUES (?, ?, ?)")
 	if err != nil {
 		return err
 	}
@@ -69,7 +73,7 @@ func (b *sqliteBatch) changelogMaybeCommit() (err error) {
 }
 
 func (b *sqliteBatch) changelogBatchCommit() error {
-	if err := b.sql.leafWrite.Commit(); err != nil {
+	if err := b.leafTx.Commit(); err != nil {
 		return err
 	}
 	if err := b.leafInsert.Close(); err != nil {
@@ -92,25 +96,27 @@ func (b *sqliteBatch) changelogBatchCommit() error {
 }
 
 func (b *sqliteBatch) execBranchOrphan(nodeKey NodeKey) error {
-	return b.treeOrphan.Exec(nodeKey.Version(), int(nodeKey.Sequence()), b.tree.version)
+	_, err := b.treeOrphan.Exec(nodeKey.Version(), int(nodeKey.Sequence()), b.tree.version)
+	return err
 }
 
 func (b *sqliteBatch) newTreeBatch(shardID int64) (err error) {
-	if err = b.sql.treeWrite.Begin(); err != nil {
+	b.treeTx, err = b.sql.treeWrite.BeginTx(context.Background(), &dsql.TxOptions{})
+	if err != nil {
 		return err
 	}
-	b.treeInsert, err = b.sql.treeWrite.Prepare(fmt.Sprintf(
+	b.treeInsert, err = b.treeTx.Prepare(fmt.Sprintf(
 		"INSERT INTO tree_%d (version, sequence, bytes) VALUES (?, ?, ?)", shardID))
 	if err != nil {
 		return err
 	}
-	b.treeOrphan, err = b.sql.treeWrite.Prepare("INSERT INTO orphan (version, sequence, at) VALUES (?, ?, ?)")
+	b.treeOrphan, err = b.treeTx.Prepare("INSERT INTO orphan (version, sequence, at) VALUES (?, ?, ?)")
 	b.treeSince = time.Now()
 	return err
 }
 
 func (b *sqliteBatch) treeBatchCommit() error {
-	if err := b.sql.treeWrite.Commit(); err != nil {
+	if err := b.treeTx.Commit(); err != nil {
 		return err
 	}
 	if err := b.treeInsert.Close(); err != nil {
@@ -170,11 +176,11 @@ func (b *sqliteBatch) saveLeaves() (int64, error) {
 			return 0, err
 		}
 		byteCount += int64(len(bz))
-		if err = b.leafInsert.Exec(leaf.nodeKey.Version(), int(leaf.nodeKey.Sequence()), bz); err != nil {
+		if _, err = b.leafInsert.Exec(leaf.nodeKey.Version(), int(leaf.nodeKey.Sequence()), bz); err != nil {
 			return 0, err
 		}
 		if tree.storeLatestLeaves {
-			if err = b.latestInsert.Exec(leaf.key, val); err != nil {
+			if _, err = b.latestInsert.Exec(leaf.key, val); err != nil {
 				return 0, err
 			}
 		}
@@ -194,12 +200,12 @@ func (b *sqliteBatch) saveLeaves() (int64, error) {
 
 	for _, leafDelete := range tree.deletes {
 		b.leafCount++
-		err = b.deleteInsert.Exec(leafDelete.deleteKey.Version(), int(leafDelete.deleteKey.Sequence()), leafDelete.leafKey)
+		_, err = b.deleteInsert.Exec(leafDelete.deleteKey.Version(), int(leafDelete.deleteKey.Sequence()), leafDelete.leafKey)
 		if err != nil {
 			return 0, err
 		}
 		if tree.storeLatestLeaves {
-			if err = b.latestDelete.Exec(leafDelete.leafKey); err != nil {
+			if _, err = b.latestDelete.Exec(leafDelete.leafKey); err != nil {
 				return 0, err
 			}
 		}
@@ -210,7 +216,7 @@ func (b *sqliteBatch) saveLeaves() (int64, error) {
 
 	for _, orphan := range tree.leafOrphans {
 		b.leafCount++
-		err = b.leafOrphan.Exec(orphan.Version(), int(orphan.Sequence()), b.tree.version)
+		_, err = b.leafOrphan.Exec(orphan.Version(), int(orphan.Sequence()), b.tree.version)
 		if err != nil {
 			return 0, err
 		}
@@ -223,7 +229,7 @@ func (b *sqliteBatch) saveLeaves() (int64, error) {
 		return 0, err
 	}
 
-	err = tree.sql.leafWrite.Exec("CREATE UNIQUE INDEX IF NOT EXISTS leaf_idx ON leaf (version, sequence)")
+	_, err = tree.sql.leafWrite.ExecContext(context.Background(), "CREATE UNIQUE INDEX IF NOT EXISTS leaf_idx ON leaf (version, sequence)")
 	if err != nil {
 		return byteCount, err
 	}
@@ -257,7 +263,7 @@ func (b *sqliteBatch) saveBranches() (n int64, err error) {
 			if err != nil {
 				return 0, err
 			}
-			if err = b.treeInsert.Exec(node.nodeKey.Version(), int(node.nodeKey.Sequence()), bz); err != nil {
+			if _, err = b.treeInsert.Exec(node.nodeKey.Version(), int(node.nodeKey.Sequence()), bz); err != nil {
 				return 0, err
 			}
 			if err = b.treeMaybeCommit(shardID); err != nil {
@@ -282,7 +288,7 @@ func (b *sqliteBatch) saveBranches() (n int64, err error) {
 		if err = b.treeBatchCommit(); err != nil {
 			return 0, err
 		}
-		err = b.sql.treeWrite.Exec(fmt.Sprintf(
+		_, err = b.sql.treeWrite.ExecContext(context.Background(), fmt.Sprintf(
 			"CREATE INDEX IF NOT EXISTS tree_idx_%d ON tree_%d (version, sequence);", shardID, shardID))
 		if err != nil {
 			return 0, err

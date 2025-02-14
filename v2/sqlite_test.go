@@ -1,15 +1,14 @@
 package iavl
 
 import (
-	"sync"
+	"context"
+	dsql "database/sql"
 	"testing"
 	"time"
 
-	"github.com/bvinc/go-sqlite-lite/sqlite3"
 	"github.com/cosmos/iavl/v2/testutil"
 	"github.com/dustin/go-humanize"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 func TestBuildSqlite(t *testing.T) {
@@ -32,24 +31,28 @@ func TestBuildSqlite(t *testing.T) {
 	require.NoError(t, err)
 	conn := sql.treeWrite
 
-	err = conn.Exec("CREATE TABLE node (seq INTEGER, version INTEGER, hash BLOB, key BLOB, height INTEGER, size INTEGER, l_seq INTEGER, l_version INTEGER, r_seq INTEGER, r_version INTEGER)")
+	ctx := context.Background()
+	_, err = conn.ExecContext(ctx, "CREATE TABLE node (seq INTEGER, version INTEGER, hash BLOB, key BLOB, height INTEGER, size INTEGER, l_seq INTEGER, l_version INTEGER, r_seq INTEGER, r_version INTEGER)")
 	require.NoError(t, err)
 
 	// enable this to demonstrate the slowness of a blob key index
 	// err = conn.Exec("CREATE INDEX node_key_idx ON node (key)")
-	err = conn.Exec("CREATE INDEX node_key_idx ON node (version, seq)")
+	_, err = conn.ExecContext(ctx, "CREATE INDEX node_key_idx ON node (version, seq)")
 	require.NoError(t, err)
 
-	err = conn.Exec("CREATE INDEX tree_idx ON tree_1 (version, sequence)")
+	_, err = conn.ExecContext(ctx, "CREATE INDEX tree_idx ON tree_1 (version, sequence)")
 	require.NoError(t, err)
 
-	require.NoError(t, conn.Begin())
-
-	var stmt *sqlite3.Stmt
-	stmt, err = conn.Prepare("INSERT INTO node(version, seq, hash, key, height, size, l_seq, l_version, r_seq, r_version)" +
-		"VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-
+	tx, err := conn.BeginTx(ctx, &dsql.TxOptions{})
 	require.NoError(t, err)
+
+	newStmt := func() *dsql.Stmt {
+		stmt, err := tx.Prepare("INSERT INTO node(version, seq, hash, key, height, size, l_seq, l_version, r_seq, r_version)" +
+			"VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		require.NoError(t, err)
+		return stmt
+	}
+	stmt := newStmt()
 
 	startTime := time.Now()
 	batchSize := 200_000
@@ -81,7 +84,7 @@ func TestBuildSqlite(t *testing.T) {
 		// require.NoError(t, err)
 
 		// node table
-		err = stmt.Exec(
+		_, err = stmt.Exec(
 			1,          // version
 			count,      // seq
 			n.key[:32], // hash
@@ -95,11 +98,12 @@ func TestBuildSqlite(t *testing.T) {
 		)
 
 		if count%batchSize == 0 {
-			err := conn.Commit()
+			err := tx.Commit()
 			require.NoError(t, err)
 			// stmt, err = newBatch()
 			// require.NoError(t, err)
-			require.NoError(t, conn.Begin())
+			tx, err = conn.BeginTx(ctx, &dsql.TxOptions{})
+			stmt = newStmt()
 			t.Logf("nodes=%s dur=%s; rate=%s",
 				humanize.Comma(int64(count)),
 				time.Since(since).Round(time.Millisecond),
@@ -111,7 +115,7 @@ func TestBuildSqlite(t *testing.T) {
 	}
 
 	t.Log("final commit")
-	require.NoError(t, conn.Commit())
+	require.NoError(t, tx.Commit())
 	t.Logf("total dur=%s rate=%s",
 		time.Since(startTime).Round(time.Millisecond),
 		humanize.Comma(int64(40_000_000/time.Since(startTime).Seconds())),
@@ -127,27 +131,6 @@ func TestNodeKeyFormat(t *testing.T) {
 	t.Logf("k: %d - %x\n", k, k)
 }
 
-func TestMmap(t *testing.T) {
-	tmpDir := t.TempDir()
-	conn, err := sqlite3.Open(tmpDir + "/test.db")
-	require.NoError(t, err)
-	stmt, err := conn.Prepare("PRAGMA mmap_size=1000000000000")
-	require.NoError(t, err)
-	ok, err := stmt.Step()
-	require.NoError(t, err)
-	require.True(t, ok)
-
-	stmt, err = conn.Prepare("PRAGMA mmap_size")
-	require.NoError(t, err)
-	ok, err = stmt.Step()
-	require.NoError(t, err)
-	require.True(t, ok)
-	res, ok, err := stmt.ColumnRawString(0)
-	require.True(t, ok)
-	require.NoError(t, err)
-	t.Logf("res: %s\n", res)
-}
-
 func Test_NewSqliteDb(t *testing.T) {
 	dir := t.TempDir()
 	sql, err := NewSqliteDb(NewNodePool(), SqliteDbOptions{Path: dir})
@@ -155,15 +138,16 @@ func Test_NewSqliteDb(t *testing.T) {
 	require.NotNil(t, sql)
 }
 
+/*
 func Test_ConcurrentDetach(t *testing.T) {
 	t.Skipf("this test will sometimes panic within a panic, kept to show what doesn't work")
 
 	dir := t.TempDir()
-	conn, err := sqlite3.Open(dir + "/one.db")
+	conn, err := dsql.Open(driverName, dir+"/one.db")
 	require.NoError(t, err)
-	err = conn.Exec("CREATE TABLE foo (id INTEGER PRIMARY KEY)")
+	_, err = conn.Exec("CREATE TABLE foo (id INTEGER PRIMARY KEY)")
 	require.NoError(t, err)
-	err = conn.Exec("INSERT INTO foo VALUES (4)")
+	_, err = conn.Exec("INSERT INTO foo VALUES (4)")
 	require.NoError(t, err)
 
 	conn2, err := sqlite3.Open(dir + "/two.db")
@@ -174,8 +158,9 @@ func Test_ConcurrentDetach(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, conn2.Close())
 
-	require.NoError(t, conn.Exec("ATTACH DATABASE ? AS two", dir+"/two.db"))
-	err = conn.Exec("SELECT * FROM bar")
+	_, err = conn.Exec("ATTACH DATABASE ? AS two", dir+"/two.db")
+	require.NoError(t, err)
+	_, err = conn.Exec("SELECT * FROM bar")
 	require.NoError(t, err)
 
 	conn3, err := sqlite3.Open(dir + "/three.db")
@@ -190,22 +175,23 @@ func Test_ConcurrentDetach(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		q, err := conn.Prepare("SELECT * FROM bar")
+		rows, err := conn.Query("SELECT * FROM bar")
 		require.NoError(t, err)
 		for i := 0; i < 500_000; i++ {
-			hasRow, err := q.Step()
-			require.NoError(t, err)
+			hasRow := rows.Next()
 			require.True(t, hasRow)
+			require.NoError(t, rows.Err())
 			var v int
-			err = q.Scan(&v)
+			err = rows.Scan(&v)
 			require.NoError(t, err)
 			require.Equal(t, 7, v)
-			require.NoError(t, q.Reset())
 		}
 	}()
 
-	require.NoError(t, conn.Exec("ATTACH DATABASE ? AS three", dir+"/three.db"))
-	require.Error(t, conn.Exec("DETACH DATABASE ?", dir+"/two.db"))
+	_, err = conn.Exec("ATTACH DATABASE ? AS three", dir+"/three.db")
+	require.NoError(t, err)
+	_, err = conn.Exec("DETACH DATABASE ?", dir+"/two.db")
+	require.Error(t, err)
 
 	wg.Wait()
 }
@@ -213,7 +199,7 @@ func Test_ConcurrentDetach(t *testing.T) {
 func Test_ConcurrentQuery(t *testing.T) {
 	t.Skipf("this test will panic within a panic, kept to show what doesn't work")
 	dir := t.TempDir()
-	conn, err := sqlite3.Open(dir + "/one.db")
+	conn, err := dsql.Open(driverName, dir+"/one.db")
 	require.NoError(t, err)
 	err = conn.Exec("CREATE TABLE foo (id INTEGER PRIMARY KEY)")
 	require.NoError(t, err)
@@ -322,3 +308,4 @@ func Test_ConcurrentIndexRead(t *testing.T) {
 	err = conn.Exec("CREATE INDEX foo_idx ON foo (id)")
 	require.NoError(t, err)
 }
+*/

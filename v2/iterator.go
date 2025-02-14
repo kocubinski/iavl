@@ -2,10 +2,10 @@ package iavl
 
 import (
 	"bytes"
+	dsql "database/sql"
 	"fmt"
 	"time"
 
-	"github.com/bvinc/go-sqlite-lite/sqlite3"
 	"github.com/cosmos/iavl/v2/metrics"
 )
 
@@ -227,16 +227,16 @@ func (i *TreeIterator) Close() error {
 }
 
 type LeafIterator struct {
-	sql     *SqliteDb
-	itrStmt *sqlite3.Stmt
-	start   []byte
-	end     []byte
-	valid   bool
-	err     error
-	key     []byte
-	value   []byte
-	metrics metrics.Proxy
-	itrIdx  int
+	sql      *SqliteDb
+	leafRows *dsql.Rows
+	start    []byte
+	end      []byte
+	valid    bool
+	err      error
+	key      []byte
+	value    []byte
+	metrics  metrics.Proxy
+	itrIdx   int
 }
 
 func (l *LeafIterator) Domain() (start []byte, end []byte) {
@@ -255,7 +255,8 @@ func (l *LeafIterator) Next() {
 		return
 	}
 
-	hasRow, err := l.itrStmt.Step()
+	hasRow := l.leafRows.Next()
+	err := l.leafRows.Err()
 	if err != nil {
 		closeErr := l.Close()
 		if closeErr != nil {
@@ -270,7 +271,7 @@ func (l *LeafIterator) Next() {
 		}
 		return
 	}
-	if err = l.itrStmt.Scan(&l.key, &l.value); err != nil {
+	if err = l.leafRows.Scan(&l.key, &l.value); err != nil {
 		closeErr := l.Close()
 		if closeErr != nil {
 			l.err = fmt.Errorf("error closing iterator: %w; %w", closeErr, err)
@@ -298,7 +299,7 @@ func (l *LeafIterator) Close() error {
 		}
 		l.valid = false
 		delete(l.sql.iterators, l.itrIdx)
-		return l.itrStmt.Close()
+		return l.leafRows.Close()
 	}
 	return nil
 }
@@ -313,8 +314,7 @@ func (tree *Tree) Iterator(start, end []byte, inclusive bool) (itr Iterator, err
 			metrics: tree.metricsProxy,
 		}
 		// TODO: handle inclusive
-		// TODO: profile re-use of some prepared statement to see if there is improvement
-		leafItr.itrStmt, leafItr.itrIdx, err = tree.sql.getLeafIteratorQuery(start, end, true, inclusive)
+		leafItr.leafRows, leafItr.itrIdx, err = tree.sql.getLeafIteratorQuery(start, end, true, inclusive)
 		if err != nil {
 			return nil, err
 		}
@@ -349,8 +349,7 @@ func (tree *Tree) ReverseIterator(start, end []byte) (itr Iterator, err error) {
 			metrics: tree.metricsProxy,
 		}
 		// TODO: handle inclusive
-		// TODO: profile re-use of some prepared statement to see if there is improvement
-		leafItr.itrStmt, leafItr.itrIdx, err = tree.sql.getLeafIteratorQuery(start, end, false, false)
+		leafItr.leafRows, leafItr.itrIdx, err = tree.sql.getLeafIteratorQuery(start, end, false, false)
 		if err != nil {
 			return nil, err
 		}

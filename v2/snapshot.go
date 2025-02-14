@@ -3,6 +3,7 @@ package iavl
 import (
 	"bytes"
 	"context"
+	dsql "database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -10,20 +11,20 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/bvinc/go-sqlite-lite/sqlite3"
 	"github.com/dustin/go-humanize"
 	api "github.com/kocubinski/costor-api"
-	"github.com/kocubinski/costor-api/logz"
 )
 
 type sqliteSnapshot struct {
 	ctx context.Context
 
-	snapshotInsert *sqlite3.Stmt
+	snapshotInsert *dsql.Stmt
 
 	sql        *SqliteDb
-	leafInsert *sqlite3.Stmt
-	treeInsert *sqlite3.Stmt
+	leafInsert *dsql.Stmt
+	treeInsert *dsql.Stmt
+	leafTx     *dsql.Tx
+	treeTx     *dsql.Tx
 
 	// if set will flush nodes to a tree & leaf tables as well as a snapshot table during import
 	writeTree bool
@@ -39,8 +40,8 @@ type sqliteSnapshot struct {
 
 func (sql *SqliteDb) Snapshot(ctx context.Context, tree *Tree) error {
 	version := tree.version
-	err := sql.leafWrite.Exec(
-		fmt.Sprintf("CREATE TABLE snapshot_%d (ordinal int, version int, sequence int, bytes blob);", version))
+	_, err := sql.leafWrite.ExecContext(
+		ctx, fmt.Sprintf("CREATE TABLE snapshot_%d (ordinal int, version int, sequence int, bytes blob);", version))
 	if err != nil {
 		return err
 	}
@@ -68,7 +69,7 @@ func (sql *SqliteDb) Snapshot(ctx context.Context, tree *Tree) error {
 		return err
 	}
 	sql.logger.Info(fmt.Sprintf("creating index on snapshot_%d", version), "path", sql.opts.Path)
-	err = sql.leafWrite.Exec(fmt.Sprintf("CREATE INDEX snapshot_%d_idx ON snapshot_%d (ordinal);", version, version))
+	_, err = sql.leafWrite.ExecContext(ctx, fmt.Sprintf("CREATE INDEX snapshot_%d_idx ON snapshot_%d (ordinal);", version, version))
 	return err
 }
 
@@ -79,39 +80,40 @@ type SnapshotOptions struct {
 	TraverseOrder     TraverseOrderType
 }
 
-func NewIngestSnapshotConnection(snapshotDbPath string) (*sqlite3.Conn, error) {
+func NewIngestSnapshotConnection(snapshotDbPath string) (*dsql.Conn, error) {
 	newDb := !api.IsFileExistent(snapshotDbPath)
 
-	conn, err := sqlite3.Open(fmt.Sprintf("file:%s", snapshotDbPath))
+	db, err := dsql.Open(driverName, fmt.Sprintf("file:%s", snapshotDbPath))
 	if err != nil {
 		return nil, err
 	}
 	pageSize := os.Getpagesize()
 	if newDb {
-		err = conn.Exec(fmt.Sprintf("PRAGMA page_size=%d; VACUUM;", pageSize))
+		_, err = db.Exec(fmt.Sprintf("PRAGMA page_size=%d; VACUUM;", pageSize))
 		if err != nil {
 			return nil, err
 		}
 
-		err = conn.Exec("PRAGMA journal_mode=WAL;")
+		_, err = db.Exec("PRAGMA journal_mode=WAL;")
 		if err != nil {
 			return nil, err
 		}
 	}
-	err = conn.Exec("PRAGMA synchronous=OFF;")
+	_, err = db.Exec("PRAGMA synchronous=OFF;")
 	if err != nil {
 		return nil, err
 	}
 	walSize := 1024 * 1024 * 1024
-	if err = conn.Exec(fmt.Sprintf("PRAGMA wal_autocheckpoint=%d", walSize/pageSize)); err != nil {
+	if _, err = db.Exec(fmt.Sprintf("PRAGMA wal_autocheckpoint=%d", walSize/pageSize)); err != nil {
 		return nil, err
 	}
-	return conn, err
+	return db.Conn(context.Background())
 }
 
-func IngestSnapshot(conn *sqlite3.Conn, prefix string, version int64, nextFn func() (*SnapshotNode, error)) (*Node, error) {
+/*
+func IngestSnapshot(conn *dsql.Conn, prefix string, version int64, nextFn func() (*SnapshotNode, error)) (*Node, error) {
 	var (
-		insert    *sqlite3.Stmt
+		insert    *dsql.Stmt
 		tableName = fmt.Sprintf("snapshot_%s_%d", prefix, version)
 		ordinal   int
 		batchSize = 200_000
@@ -232,6 +234,7 @@ func IngestSnapshot(conn *sqlite3.Conn, prefix string, version int64, nextFn fun
 	}
 	return root, nil
 }
+*/
 
 func (sql *SqliteDb) WriteSnapshot(
 	ctx context.Context, version int64, nextFn func() (*SnapshotNode, error), opts SnapshotOptions,
@@ -250,8 +253,8 @@ func (sql *SqliteDb) WriteSnapshot(
 			return nil, err
 		}
 	}
-	err := snap.sql.leafWrite.Exec(
-		fmt.Sprintf(`CREATE TABLE snapshot_%d (ordinal int, version int, sequence int, bytes blob);`, version))
+	_, err := snap.sql.leafWrite.ExecContext(
+		ctx, fmt.Sprintf(`CREATE TABLE snapshot_%d (ordinal int, version int, sequence int, bytes blob);`, version))
 	if err != nil {
 		return nil, err
 	}
@@ -286,16 +289,16 @@ func (sql *SqliteDb) WriteSnapshot(
 	}
 
 	sql.logger.Info("creating table indexes")
-	err = sql.leafWrite.Exec(fmt.Sprintf("CREATE INDEX snapshot_%d_idx ON snapshot_%d (ordinal);", version, version))
+	_, err = sql.leafWrite.ExecContext(ctx, fmt.Sprintf("CREATE INDEX snapshot_%d_idx ON snapshot_%d (ordinal);", version, version))
 	if err != nil {
 		return nil, err
 	}
-	err = snap.sql.treeWrite.Exec(fmt.Sprintf(
+	_, err = snap.sql.treeWrite.ExecContext(ctx, fmt.Sprintf(
 		"CREATE INDEX IF NOT EXISTS tree_idx_%d ON tree_%d (version, sequence);", snap.version, snap.version))
 	if err != nil {
 		return nil, err
 	}
-	err = snap.sql.leafWrite.Exec("CREATE UNIQUE INDEX IF NOT EXISTS leaf_idx ON leaf (version, sequence)")
+	_, err = snap.sql.leafWrite.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS leaf_idx ON leaf (version, sequence)")
 	if err != nil {
 		return nil, err
 	}
@@ -316,24 +319,25 @@ func (sql *SqliteDb) ImportSnapshotFromTable(version int64, traverseOrder Traver
 		return nil, err
 	}
 
-	var q *sqlite3.Stmt
+	ctx := context.Background()
+	var rows *dsql.Rows
 	if traverseOrder == PostOrder {
-		q, err = read.Prepare(fmt.Sprintf("SELECT version, sequence, bytes FROM snapshot_%d ORDER BY ordinal DESC", version))
+		rows, err = read.QueryContext(ctx, fmt.Sprintf("SELECT version, sequence, bytes FROM snapshot_%d ORDER BY ordinal DESC", version))
 	} else if traverseOrder == PreOrder {
-		q, err = read.Prepare(fmt.Sprintf("SELECT version, sequence, bytes FROM snapshot_%d ORDER BY ordinal ASC", version))
+		rows, err = read.QueryContext(ctx, fmt.Sprintf("SELECT version, sequence, bytes FROM snapshot_%d ORDER BY ordinal ASC", version))
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer func(q *sqlite3.Stmt) {
-		err = q.Close()
-		if err != nil {
+	defer func() {
+		closeErr := rows.Close()
+		if closeErr != nil {
 			sql.logger.Error("error closing import query", "error", err)
 		}
-	}(q)
+	}()
 
 	imp := &sqliteImport{
-		query:      q,
+		query:      rows,
 		pool:       sql.pool,
 		loadLeaves: loadLeaves,
 		since:      time.Now(),
@@ -363,17 +367,13 @@ func (sql *SqliteDb) ImportSnapshotFromTable(version int64, traverseOrder Traver
 }
 
 func (sql *SqliteDb) ImportMostRecentSnapshot(targetVersion int64, traverseOrder TraverseOrderType, loadLeaves bool) (*Node, int64, error) {
+	ctx := context.Background()
 	read, err := sql.getReadConn()
 	if err != nil {
 		return nil, 0, err
 	}
-	q, err := read.Prepare("SELECT tbl_name FROM changelog.sqlite_master WHERE type='table' AND name LIKE 'snapshot_%' ORDER BY name DESC")
-	defer func(q *sqlite3.Stmt) {
-		err = q.Close()
-		if err != nil {
-			sql.logger.Error("error closing import query", "error", err)
-		}
-	}(q)
+	rows, err := read.QueryContext(ctx, "SELECT tbl_name FROM changelog.sqlite_master WHERE type='table' AND name LIKE 'snapshot_%' ORDER BY name DESC")
+	defer rows.Close()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -382,15 +382,8 @@ func (sql *SqliteDb) ImportMostRecentSnapshot(targetVersion int64, traverseOrder
 		name    string
 		version int64
 	)
-	for {
-		ok, err := q.Step()
-		if err != nil {
-			return nil, 0, err
-		}
-		if !ok {
-			return nil, 0, fmt.Errorf("no prior snapshot found version=%d path=%s", targetVersion, sql.opts.Path)
-		}
-		err = q.Scan(&name)
+	for rows.Next() {
+		err = rows.Scan(&name)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -405,6 +398,9 @@ func (sql *SqliteDb) ImportMostRecentSnapshot(targetVersion int64, traverseOrder
 		if version <= targetVersion {
 			break
 		}
+	}
+	if version == 0 {
+		return nil, 0, fmt.Errorf("no prior snapshot found version=%d path=%s", targetVersion, sql.opts.Path)
 	}
 
 	root, err := sql.ImportSnapshotFromTable(version, traverseOrder, loadLeaves)
@@ -442,7 +438,7 @@ func (snap *sqliteSnapshot) writeStep(node *Node) error {
 	if err != nil {
 		return err
 	}
-	err = snap.snapshotInsert.Exec(snap.ordinal, node.nodeKey.Version(), int(node.nodeKey.Sequence()), nodeBz)
+	_, err = snap.snapshotInsert.Exec(snap.ordinal, node.nodeKey.Version(), int(node.nodeKey.Sequence()), nodeBz)
 	if err != nil {
 		return err
 	}
@@ -475,7 +471,6 @@ func (snap *sqliteSnapshot) flush() error {
 	case <-snap.ctx.Done():
 		snap.log.Info(fmt.Sprintf("snapshot cancelled at ordinal=%s", humanize.Comma(int64(snap.ordinal))))
 		errs := errors.Join(
-			snap.snapshotInsert.Reset(),
 			snap.snapshotInsert.Close(),
 		)
 		if errs != nil {
@@ -483,15 +478,13 @@ func (snap *sqliteSnapshot) flush() error {
 		}
 		if snap.writeTree {
 			errs = errors.Join(
-				snap.leafInsert.Reset(),
 				snap.leafInsert.Close(),
-				snap.treeInsert.Reset(),
 				snap.treeInsert.Close(),
 			)
 		}
 		errs = errors.Join(
 			errs,
-			snap.sql.leafWrite.Rollback(),
+			snap.leafTx.Rollback(),
 			snap.sql.leafWrite.Close(),
 		)
 		if errs != nil {
@@ -500,7 +493,7 @@ func (snap *sqliteSnapshot) flush() error {
 		if snap.writeTree {
 			errs = errors.Join(
 				errs,
-				snap.sql.treeWrite.Rollback(),
+				snap.treeTx.Rollback(),
 				snap.sql.treeWrite.Close(),
 			)
 		}
@@ -517,7 +510,7 @@ func (snap *sqliteSnapshot) flush() error {
 	))
 
 	err := errors.Join(
-		snap.sql.leafWrite.Commit(),
+		snap.leafTx.Commit(),
 		snap.snapshotInsert.Close(),
 	)
 	if err != nil {
@@ -526,7 +519,7 @@ func (snap *sqliteSnapshot) flush() error {
 	if snap.writeTree {
 		err = errors.Join(
 			snap.leafInsert.Close(),
-			snap.sql.treeWrite.Commit(),
+			snap.treeTx.Commit(),
 			snap.treeInsert.Close(),
 		)
 	}
@@ -535,26 +528,27 @@ func (snap *sqliteSnapshot) flush() error {
 }
 
 func (snap *sqliteSnapshot) prepareWrite() error {
-	err := snap.sql.leafWrite.Begin()
+	var err error
+	snap.leafTx, err = snap.sql.leafWrite.BeginTx(context.Background(), &dsql.TxOptions{})
 	if err != nil {
 		return err
 	}
 
-	snap.snapshotInsert, err = snap.sql.leafWrite.Prepare(
+	snap.snapshotInsert, err = snap.leafTx.Prepare(
 		fmt.Sprintf("INSERT INTO snapshot_%d (ordinal, version, sequence, bytes) VALUES (?, ?, ?, ?);",
 			snap.version))
 
 	if snap.writeTree {
-		err = snap.sql.treeWrite.Begin()
+		snap.treeTx, err = snap.sql.treeWrite.BeginTx(context.Background(), &dsql.TxOptions{})
 		if err != nil {
 			return err
 		}
 
-		snap.leafInsert, err = snap.sql.leafWrite.Prepare("INSERT INTO leaf (version, sequence, bytes) VALUES (?, ?, ?)")
+		snap.leafInsert, err = snap.leafTx.Prepare("INSERT INTO leaf (version, sequence, bytes) VALUES (?, ?, ?)")
 		if err != nil {
 			return err
 		}
-		snap.treeInsert, err = snap.sql.treeWrite.Prepare(
+		snap.treeInsert, err = snap.treeTx.Prepare(
 			fmt.Sprintf("INSERT INTO tree_%d (version, sequence, bytes) VALUES (?, ?, ?)", snap.version))
 	}
 
@@ -698,16 +692,16 @@ func (snap *sqliteSnapshot) writeSnapNode(node *Node, version int64, ordinal, se
 	if err != nil {
 		return err
 	}
-	if err = snap.snapshotInsert.Exec(ordinal, version, sequence, nodeBz); err != nil {
+	if _, err = snap.snapshotInsert.Exec(ordinal, version, sequence, nodeBz); err != nil {
 		return err
 	}
 	if snap.writeTree {
 		if node.isLeaf() {
-			if err = snap.leafInsert.Exec(version, ordinal, nodeBz); err != nil {
+			if _, err = snap.leafInsert.Exec(version, ordinal, nodeBz); err != nil {
 				return err
 			}
 		} else {
-			if err = snap.treeInsert.Exec(version, sequence, nodeBz); err != nil {
+			if _, err = snap.treeInsert.Exec(version, sequence, nodeBz); err != nil {
 				return err
 			}
 		}
@@ -738,7 +732,7 @@ func rehashTree(node *Node) {
 }
 
 type sqliteImport struct {
-	query      *sqlite3.Stmt
+	query      *dsql.Rows
 	pool       *NodePool
 	loadLeaves bool
 
@@ -757,14 +751,15 @@ func (sqlImport *sqliteImport) queryStepPreOrder() (node *Node, err error) {
 		sqlImport.since = time.Now()
 	}
 
-	hasRow, err := sqlImport.query.Step()
-	if !hasRow {
+	ok := sqlImport.query.Next()
+	nextErr := sqlImport.query.Err()
+	if nextErr != nil {
+		return nil, nextErr
+	}
+	if !ok {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	var bz sqlite3.RawBytes
+	var bz []byte
 	var version, seq int
 	err = sqlImport.query.Scan(&version, &seq, &bz)
 	if err != nil {
@@ -805,14 +800,16 @@ func (sqlImport *sqliteImport) queryStepPostOrder() (node *Node, err error) {
 		sqlImport.since = time.Now()
 	}
 
-	hasRow, err := sqlImport.query.Step()
-	if !hasRow {
+	ok := sqlImport.query.Next()
+	nextErr := sqlImport.query.Err()
+	if nextErr != nil {
+		return nil, nextErr
+	}
+	if !ok {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	var bz sqlite3.RawBytes
+
+	var bz []byte
 	var version, seq int
 	err = sqlImport.query.Scan(&version, &seq, &bz)
 	if err != nil {

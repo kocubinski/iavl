@@ -1,14 +1,16 @@
 module github.com/cosmos/iavl/v2
 
-go 1.18
+go 1.21
+
+toolchain go1.23.6
 
 require (
 	github.com/aybabtme/uniplot v0.0.0-20151203143629-039c559e5e7e
-	github.com/bvinc/go-sqlite-lite v0.6.1
 	github.com/cosmos/iavl-bench/bench v0.0.4
 	github.com/dustin/go-humanize v1.0.1
 	github.com/emicklei/dot v1.6.0
 	github.com/kocubinski/costor-api v1.1.1
+	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/prometheus/client_golang v1.16.0
 	github.com/spf13/cobra v1.7.0
 	github.com/stretchr/testify v1.8.4
@@ -30,7 +32,7 @@ require (
 	github.com/prometheus/procfs v0.10.1 // indirect
 	github.com/rs/zerolog v1.33.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
-	golang.org/x/sys v0.22.0 // indirect
+	golang.org/x/sys v0.28.0 // indirect
 	google.golang.org/protobuf v1.33.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

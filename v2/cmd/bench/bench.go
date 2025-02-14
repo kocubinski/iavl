@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -98,6 +99,7 @@ $ go run ./cmd snapshot --db /tmp/iavl-v2 --version 1
 			opts.Until = 500
 			opts.UntilHash = "2670bd5767e70f2bf9e4f723b5f205759e39afdb5d8cfb6b54a4a3ecc27a1377"
 
+			fmt.Println("running std dev benchmark...")
 			_, err := multiTree.TestBuild(opts)
 			return err
 		},
