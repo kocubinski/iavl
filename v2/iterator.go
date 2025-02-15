@@ -372,3 +372,16 @@ func (tree *Tree) ReverseIterator(start, end []byte) (itr Iterator, err error) {
 	itr.Next()
 	return itr, nil
 }
+
+func (tree *Tree) IterateRecent(version int64, start, end []byte, ascending bool) (bool, Iterator) {
+	if tree.version != version {
+		panic(fmt.Sprintf("version mismatch: tree=%d, want=%d", tree.version, version))
+	}
+	itr, err := tree.Iterator(start, end, ascending)
+	if err != nil {
+		panic(err)
+	}
+	return true, itr
+}
+
+func SetGlobalPruneLimit(limit int) {}
