@@ -11,8 +11,14 @@ import (
 )
 
 type sqliteBatch struct {
-	tree    *Tree
-	sql     *SqliteDb
+	leafWrite         *dsql.Conn
+	treeWrite         *dsql.Conn
+	version           int64
+	writeQueue        *writeQueue
+	storeLatestLeaves bool
+	returnNode        func(*Node)
+	shardID           int64
+
 	size    int64
 	logger  Logger
 	metrics metrics.Proxy
@@ -34,7 +40,7 @@ type sqliteBatch struct {
 }
 
 func (b *sqliteBatch) newChangeLogBatch() (err error) {
-	b.leafTx, err = b.sql.leafWrite.BeginTx(context.Background(), &dsql.TxOptions{})
+	b.leafTx, err = b.leafWrite.BeginTx(context.Background(), &dsql.TxOptions{})
 	if err != nil {
 		return err
 	}
@@ -98,12 +104,12 @@ func (b *sqliteBatch) changelogBatchCommit() error {
 }
 
 func (b *sqliteBatch) execBranchOrphan(nodeKey NodeKey) error {
-	_, err := b.treeOrphan.Exec(nodeKey.Version(), int(nodeKey.Sequence()), b.tree.version)
+	_, err := b.treeOrphan.Exec(nodeKey.Version(), int(nodeKey.Sequence()), b.version)
 	return err
 }
 
 func (b *sqliteBatch) newTreeBatch(shardID int64) (err error) {
-	b.treeTx, err = b.sql.treeWrite.BeginTx(context.Background(), &dsql.TxOptions{})
+	b.treeTx, err = b.treeWrite.BeginTx(context.Background(), &dsql.TxOptions{})
 	if err != nil {
 		return err
 	}
@@ -161,13 +167,12 @@ func (b *sqliteBatch) saveLeaves() (int64, error) {
 	}
 
 	var (
-		bz   []byte
-		val  []byte
-		tree = b.tree
+		bz  []byte
+		val []byte
 	)
-	for i, leaf := range tree.leaves {
+	for _, leaf := range b.writeQueue.leaves {
 		b.leafCount++
-		if tree.storeLatestLeaves {
+		if b.storeLatestLeaves {
 			val = leaf.value
 			leaf.value = nil
 		}
@@ -178,7 +183,7 @@ func (b *sqliteBatch) saveLeaves() (int64, error) {
 		if _, err = b.leafInsert.Exec(leaf.nodeKey.Version(), int(leaf.nodeKey.Sequence()), bz); err != nil {
 			return 0, err
 		}
-		if tree.storeLatestLeaves {
+		if b.storeLatestLeaves {
 			if _, err = b.latestInsert.Exec(leaf.key, val); err != nil {
 				return 0, err
 			}
@@ -186,24 +191,18 @@ func (b *sqliteBatch) saveLeaves() (int64, error) {
 		if err = b.changelogMaybeCommit(); err != nil {
 			return 0, err
 		}
-		if tree.heightFilter > 0 {
-			if i != 0 {
-				// evict leaf
-				tree.returnNode(leaf)
-			} else if leaf.nodeKey != tree.root.nodeKey {
-				// never evict the root if it's a leaf
-				tree.returnNode(leaf)
-			}
+		if leaf.evict {
+			b.returnNode(leaf)
 		}
 	}
 
-	for _, leafDelete := range tree.deletes {
+	for _, leafDelete := range b.writeQueue.deletes {
 		b.leafCount++
 		_, err = b.deleteInsert.Exec(leafDelete.deleteKey.Version(), int(leafDelete.deleteKey.Sequence()), leafDelete.leafKey)
 		if err != nil {
 			return 0, err
 		}
-		if tree.storeLatestLeaves {
+		if b.storeLatestLeaves {
 			if _, err = b.latestDelete.Exec(leafDelete.leafKey); err != nil {
 				return 0, err
 			}
@@ -213,9 +212,9 @@ func (b *sqliteBatch) saveLeaves() (int64, error) {
 		}
 	}
 
-	for _, orphan := range tree.leafOrphans {
+	for _, orphan := range b.writeQueue.leafOrphans {
 		b.leafCount++
-		_, err = b.leafOrphan.Exec(orphan.Version(), int(orphan.Sequence()), b.tree.version)
+		_, err = b.leafOrphan.Exec(orphan.Version(), int(orphan.Sequence()), b.version)
 		if err != nil {
 			return 0, err
 		}
@@ -228,7 +227,7 @@ func (b *sqliteBatch) saveLeaves() (int64, error) {
 		return 0, err
 	}
 
-	_, err = tree.sql.leafWrite.ExecContext(context.Background(), "CREATE UNIQUE INDEX IF NOT EXISTS leaf_idx ON leaf (version, sequence)")
+	_, err = b.leafWrite.ExecContext(context.Background(), "CREATE UNIQUE INDEX IF NOT EXISTS leaf_idx ON leaf (version, sequence)")
 	if err != nil {
 		return b.leafCount, err
 	}
@@ -237,26 +236,24 @@ func (b *sqliteBatch) saveLeaves() (int64, error) {
 }
 
 func (b *sqliteBatch) isCheckpoint() bool {
-	return len(b.tree.branches) > 0
+	return len(b.writeQueue.branches) > 0
 }
 
 func (b *sqliteBatch) saveBranches() (n int64, err error) {
 	if b.isCheckpoint() {
-		tree := b.tree
 		b.treeCount = 0
-
-		shardID, err := tree.sql.nextShard(tree.version)
-		if err != nil {
-			return 0, err
+		if b.shardID == -1 {
+			return 0, fmt.Errorf("batch shardID not set during checkpoint")
 		}
+
 		b.logger.Debug(fmt.Sprintf("checkpoint db=tree version=%d shard=%d orphans=%s",
-			tree.version, shardID, humanize.Comma(int64(len(tree.branchOrphans)))))
+			b.version, b.shardID, humanize.Comma(int64(len(b.writeQueue.branchOrphans)))))
 
-		if err = b.newTreeBatch(shardID); err != nil {
+		if err = b.newTreeBatch(b.shardID); err != nil {
 			return 0, err
 		}
 
-		for _, node := range tree.branches {
+		for _, node := range b.writeQueue.branches {
 			b.treeCount++
 			bz, err := node.Bytes()
 			if err != nil {
@@ -265,21 +262,21 @@ func (b *sqliteBatch) saveBranches() (n int64, err error) {
 			if _, err = b.treeInsert.Exec(node.nodeKey.Version(), int(node.nodeKey.Sequence()), bz); err != nil {
 				return 0, err
 			}
-			if err = b.treeMaybeCommit(shardID); err != nil {
+			if err = b.treeMaybeCommit(b.shardID); err != nil {
 				return 0, err
 			}
 			if node.evict {
-				tree.returnNode(node)
+				b.returnNode(node)
 			}
 		}
 
-		for _, orphan := range tree.branchOrphans {
+		for _, orphan := range b.writeQueue.branchOrphans {
 			b.treeCount++
 			err = b.execBranchOrphan(orphan)
 			if err != nil {
 				return 0, err
 			}
-			if err = b.treeMaybeCommit(shardID); err != nil {
+			if err = b.treeMaybeCommit(b.shardID); err != nil {
 				return 0, err
 			}
 		}
@@ -287,8 +284,8 @@ func (b *sqliteBatch) saveBranches() (n int64, err error) {
 		if err = b.treeBatchCommit(); err != nil {
 			return 0, err
 		}
-		_, err = b.sql.treeWrite.ExecContext(context.Background(), fmt.Sprintf(
-			"CREATE INDEX IF NOT EXISTS tree_idx_%d ON tree_%d (version, sequence);", shardID, shardID))
+		_, err = b.treeWrite.ExecContext(context.Background(), fmt.Sprintf(
+			"CREATE INDEX IF NOT EXISTS tree_idx_%d ON tree_%d (version, sequence);", b.shardID, b.shardID))
 		if err != nil {
 			return 0, err
 		}
