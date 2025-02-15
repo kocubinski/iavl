@@ -69,6 +69,10 @@ type TreeOptions struct {
 	HeightFilter       int8
 	EvictionDepth      int8
 	MetricsProxy       metrics.Proxy
+
+	// unsupported
+	PruneRatio          float64
+	MinimumKeepVersions int64
 }
 
 func DefaultTreeOptions() TreeOptions {
@@ -307,6 +311,17 @@ func (tree *Tree) Get(key []byte) ([]byte, error) {
 		_, res, err = tree.root.get(tree, key)
 	}
 	return res, err
+}
+
+func (tree *Tree) GetRecent(version int64, key []byte) (bool, []byte, error) {
+	if tree.version != version {
+		return false, nil, fmt.Errorf("invalid version: want=%d tree=%d", version, tree.version)
+	}
+	val, err := tree.Get(key)
+	if err != nil {
+		return false, nil, err
+	}
+	return true, val, nil
 }
 
 func (tree *Tree) GetWithIndex(key []byte) (int64, []byte, error) {
