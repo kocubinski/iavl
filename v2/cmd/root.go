@@ -1,12 +1,11 @@
 package main
 
 import (
-	"github.com/cosmos/iavl/v2/cmd/bench"
-	"github.com/cosmos/iavl/v2/cmd/gen"
+	"github.com/spf13/cobra"
+
 	"github.com/cosmos/iavl/v2/cmd/rollback"
 	"github.com/cosmos/iavl/v2/cmd/scan"
 	"github.com/cosmos/iavl/v2/cmd/snapshot"
-	"github.com/spf13/cobra"
 )
 
 func RootCommand() (*cobra.Command, error) {
@@ -15,11 +14,11 @@ func RootCommand() (*cobra.Command, error) {
 		Short: "benchmark cosmos/iavl",
 	}
 	cmd.AddCommand(
-		gen.Command(),
+		//gen.Command(),
 		snapshot.Command(),
 		rollback.Command(),
 		scan.Command(),
-		bench.Command(),
+		//bench.Command(),
 		latestCommand(),
 	)
 	return cmd, nil
